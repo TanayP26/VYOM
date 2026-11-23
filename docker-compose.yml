@@ -1,0 +1,14 @@
+services:
+  api:
+    build: ./backend
+    env_file: ./backend/.env
+    ports: ["8000:8000"]
+    volumes:
+      - ./backend:/app
+      - ./data:/data:ro
+    environment:
+      DATASET_DIR: /data/esa_adb/mission1/ESA-Mission1
+  web:
+    build: ./frontend
+    ports: ["5173:5173"]
+    depends_on: [api]

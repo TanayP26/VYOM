@@ -1,0 +1,46 @@
+backend/.env
+**/.venv/
+**/__pycache__/
+**/.pytest_cache/
+**/node_modules/
+**/dist/
+backend/*.db
+data/esa_adb/
+artifacts/
+
+# Local environments / secrets
+.env
+.env.*
+!.env.example
+backend/.venv/
+.venv/
+
+# ESA dataset - never commit
+data/
+backend/data/
+
+# Generated benchmark / telemetry artifacts
+artifacts/
+backend/artifacts/
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Node
+node_modules/
+frontend/node_modules/
+frontend/dist/
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Temporary / generated
+*.tmp
+*.log
