@@ -1,4 +1,4 @@
-"""Bounded scientific metrics and exact causal point-envelope preparation.
+﻿"""Bounded scientific metrics and exact causal point-envelope preparation.
 
 Only a channel's annotation table, maximum matching graph and scalar counters
 are retained. Prediction/event rows belong in the runner's immutable fragments.
@@ -429,3 +429,4 @@ class StreamingScientificEvaluator:
         for name, view in result.views.items():
             view.restore(state["views"][name])
         return result
+

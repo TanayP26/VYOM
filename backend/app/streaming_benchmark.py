@@ -178,9 +178,17 @@ def _scores(state, raw, timing):
         flags_, scores = candidates[name] if present else (np.zeros(len(raw), bool), np.full(len(raw), np.nan))
         predictions[name+"_flag"], predictions[name+"_score"] = np.asarray(flags_), np.asarray(scores)
         if present:
-            events.extend({"model": name, **event} for event in state["groupers"][name].update(
+            grouper = state["groupers"][name]
+            completed = grouper.update(
                 raw.index, flags_, scores, timing.cadence_seconds.to_numpy(), name,
-                evidence={"score_semantics": "candidate-specific score; not a probability"}))
+                evidence={"score_semantics": "candidate-specific score; not a probability"})
+            finalized = grouper.take_finalization_times()
+            if len(finalized) != len(completed):
+                raise RuntimeError("Event finalization metadata is misaligned")
+            events.extend(
+                {"model": name, "_finalized_at": when, **event}
+                for event, when in zip(completed, finalized)
+            )
             state["coverage"][name] += len(raw)
     predictions = predictions.join(temporal.add_prefix("temporal_feature_")).join(timing.add_prefix("timing_"))
     state["truncated"] += int(temporal.truncated_history.sum())
@@ -195,6 +203,28 @@ def _test_gaps(state, gaps, channel, split):
             result.append({"model": "adaptive_gap", **gap, "channel": channel,
                 "evidence": {"cause": "unknown", "resolved_at": gap["resolved_at"], "resolution": gap["resolution"]}})
     return result
+
+
+def _canonical_event_order(events, fallback_timestamp):
+    """Order completed events independently of the outer scoring batch size."""
+    fallback = pd.Timestamp(fallback_timestamp)
+    ordered = []
+    for event in events:
+        item = dict(event)
+        finalized = item.pop("_finalized_at", None)
+        if finalized is None and isinstance(item.get("evidence"), dict):
+            finalized = item["evidence"].get("resolved_at")
+        if finalized is None:
+            finalized = fallback
+        key = (
+            pd.Timestamp(finalized).value,
+            str(item.get("model", "")),
+            pd.Timestamp(item["start"]).value,
+            pd.Timestamp(item["end"]).value,
+        )
+        ordered.append((key, item))
+    ordered.sort(key=lambda pair: pair[0])
+    return [item for _, item in ordered]
 
 
 def run_channel(path, output, channel, annotation_provider, *, labelled_channel=True,
@@ -310,13 +340,22 @@ def run_channel(path, output, channel, annotation_provider, *, labelled_channel=
                         timing = _timed(state, "cadence", lambda: state["tracker"].transform(raw.index))
                         predictions, events = _timed(state, "scoring", lambda: _scores(state, raw, timing))
                         events += _test_gaps(state, state["tracker"].drain_gaps(), channel, split)
+                        events = _canonical_event_order(events, raw.index[-1])
                         state["cursor"] += len(raw)
                         commit(frames={"predictions": predictions}, events=events)
                     events = []
                     for name, grouper in state["groupers"].items():
                         if name not in state["unsupported"]:
-                            events += [{"model": name, **event} for event in grouper.finish()]
+                            completed = grouper.finish()
+                            finalized = grouper.take_finalization_times()
+                            if len(finalized) != len(completed):
+                                raise RuntimeError("Final event ordering metadata is misaligned")
+                            events += [
+                                {"model": name, "_finalized_at": when, **event}
+                                for event, when in zip(completed, finalized)
+                            ]
                     events += _test_gaps(state, state["tracker"].finish(), channel, split)
+                    events = _canonical_event_order(events, split["test_end"])
                     state.update(stage="prepare_evaluation")
                     commit(events=events)
                 if state["stage"] == "prepare_evaluation":
@@ -372,6 +411,8 @@ def run_channel(path, output, channel, annotation_provider, *, labelled_channel=
                               "events_storage": "journal immutable events and correlated_events fragments",
                               "random_forest": {"status": "unsupported", "reason": "No independently confirmed negative training labels"},
                               "pca": {"status": "unsupported", "reason": "Separate declared paired alignment plan required"}}
+                    from app.streaming_evaluation import _plain
+                    report = _plain(report)
                     state.update(stage="done", report_fingerprint=fingerprint(report))
                     atomic_json(output/"report.json", report)
                     commit(json_values={"report": report})

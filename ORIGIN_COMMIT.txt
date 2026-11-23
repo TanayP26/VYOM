@@ -1,0 +1,3 @@
+Source repository: https://github.com/TanayP26/VYOM
+Audited source commit: 04a2fe643fcd7ac0431a39718eb6ee2fa3907862
+Final distribution: VYOM 2.0 product consolidation

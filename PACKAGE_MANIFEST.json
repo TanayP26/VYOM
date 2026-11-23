@@ -1,0 +1,186 @@
+{
+  "product": "VYOM 2.0 Final Product Consolidation - Compatibility Patch 1",
+  "files": 36,
+  "entries": [
+    {
+      "path": ".gitignore",
+      "bytes": 122,
+      "sha256": "54ea109083bc0c3210812ae3392b4f75aced9180bc85a521e083074906179757"
+    },
+    {
+      "path": "ORIGIN_COMMIT.txt",
+      "bytes": 167,
+      "sha256": "aba4c8d6aaaf8a4a468a0e7e2c9e6dff4a8ae635b0e851f82fac8416e73fe4ee"
+    },
+    {
+      "path": "README.md",
+      "bytes": 3833,
+      "sha256": "763fc5031b41e8bf0d080eaf270bc0c72ec9080df494bac68f243b40e04d5858"
+    },
+    {
+      "path": "backend/.env.example",
+      "bytes": 438,
+      "sha256": "03637640b1a12ccd7d53c3867089a8a8a34b040ec91375e48921865f43e6d246"
+    },
+    {
+      "path": "backend/Dockerfile",
+      "bytes": 246,
+      "sha256": "302b04cc43b91c121b034b13c2675a60d653f49236b010e504fea83ae15c0da9"
+    },
+    {
+      "path": "backend/app/__init__.py",
+      "bytes": 55,
+      "sha256": "4ebabdea96883aaf5b904cee7d078d5d7a5f3694e58818b2b9bbde210b8d20d2"
+    },
+    {
+      "path": "backend/app/cli.py",
+      "bytes": 1828,
+      "sha256": "f0f4354a12853071bb84f5ad78cc77b36a4065c067dca7cdb0e1e9df3b3344d4"
+    },
+    {
+      "path": "backend/app/core.py",
+      "bytes": 1628,
+      "sha256": "ac334f3915b56b1d8937e0fc6345377a63177804af3f85f5bb4d03c162d59988"
+    },
+    {
+      "path": "backend/app/dataset.py",
+      "bytes": 4514,
+      "sha256": "aeaea4931f87790b5952b5ecdc60586169184b09ca5a4845aee80449db130274"
+    },
+    {
+      "path": "backend/app/db.py",
+      "bytes": 6524,
+      "sha256": "2b55f2e2ab5a86e7e6b6154af557c5aea0f107936482b7846d40a5d0e7b0ca7f"
+    },
+    {
+      "path": "backend/app/knowledge.py",
+      "bytes": 4405,
+      "sha256": "b1f66d58004803f90f8060589f6113b6372a9af34f615f4d45da867e7317830d"
+    },
+    {
+      "path": "backend/app/main.py",
+      "bytes": 8998,
+      "sha256": "694a9c6cf4be3b21d4e0f04d93b21b2767e1687de1a42f1bbf82b6ac3db2b6cf"
+    },
+    {
+      "path": "backend/app/science.py",
+      "bytes": 22264,
+      "sha256": "465dc8588ad9d8f9f3edd8c327392525763d114332aa0570a51abc9873251a13"
+    },
+    {
+      "path": "backend/app/service.py",
+      "bytes": 4321,
+      "sha256": "0201b64b3405da3b7a3281536f8204e55b9e3465defcbe7c815aaf814bc5790d"
+    },
+    {
+      "path": "backend/requirements.txt",
+      "bytes": 252,
+      "sha256": "5b4ae56086a84702a16104ae120442aaf8fdd6c9a6772e377cc968bb49b95d68"
+    },
+    {
+      "path": "backend/tests/test_api_smoke.py",
+      "bytes": 447,
+      "sha256": "adeefac6d0e8df7b1242aa06c567b197bea3c07a82bb1db5dd463544f4f13705"
+    },
+    {
+      "path": "backend/tests/test_science_core.py",
+      "bytes": 1399,
+      "sha256": "0f23f7db701dca5a87b91556eb4d44e5a70c942e9368c185991d54f8e5fca7da"
+    },
+    {
+      "path": "docker-compose.yml",
+      "bytes": 552,
+      "sha256": "2f1173a980e607519fb16439724592b30b24d2c298fc83f745caea85bb02d9b7"
+    },
+    {
+      "path": "docs/ARCHITECTURE.md",
+      "bytes": 1726,
+      "sha256": "9bfcfc3d5712a6954d9cb24e184abd9f4e46304bf4b9b77f02866e001dd58baa"
+    },
+    {
+      "path": "docs/FINAL_VALIDATION.md",
+      "bytes": 1590,
+      "sha256": "d013c58b776f7f195c38d7c73091abedddd68a1f7fca2c48494beecb60b38e63"
+    },
+    {
+      "path": "docs/MIGRATION_FROM_GITHUB.md",
+      "bytes": 766,
+      "sha256": "a399f5c0de56c7f862ebd74ea721481144fafe7fba23a9cf25a5811e9c5d3b8c"
+    },
+    {
+      "path": "docs/OPERATIONS.md",
+      "bytes": 1032,
+      "sha256": "2e6bbaa22d29615746741464f5bd84b69d4c365fa3e7783c0dd50812e6afd778"
+    },
+    {
+      "path": "docs/REPOSITORY_AUDIT.md",
+      "bytes": 2057,
+      "sha256": "ea9140ba3c7370d32c4e2b44d587e53b03ac2ebf2f9724c3b8749deee8c2b6d6"
+    },
+    {
+      "path": "docs/SCIENTIFIC_PROTOCOL.md",
+      "bytes": 2251,
+      "sha256": "59c301059c97fe13e68108a79224d0611367d910a6bdf65881e6cf644cd51b2b"
+    },
+    {
+      "path": "frontend/Dockerfile",
+      "bytes": 264,
+      "sha256": "60ebc6ddbf364103ec3f6aa1c2cfde1f4be8e6ac5ffc93ab6b0d98dbc5467a99"
+    },
+    {
+      "path": "frontend/index.html",
+      "bytes": 305,
+      "sha256": "9c34e81f5cc5fcc6f238bfbc0baf522bf665b335368737cd60ef6f072ce8db3c"
+    },
+    {
+      "path": "frontend/package.json",
+      "bytes": 399,
+      "sha256": "4c3255b4b2279dcf5ad6d699eee1b9acc1db43781744b0e86d32eed0d22750c1"
+    },
+    {
+      "path": "frontend/src/App.tsx",
+      "bytes": 19133,
+      "sha256": "bff60d90346e16dc65c262f9748c9cec0051b2fc666baafc96d13207b6e956a0"
+    },
+    {
+      "path": "frontend/src/main.tsx",
+      "bytes": 208,
+      "sha256": "528934deec3f29f786186fb88c7394b66e5dc7988b5c2144e8b7b5b8e77e13f1"
+    },
+    {
+      "path": "frontend/src/style.css",
+      "bytes": 13186,
+      "sha256": "3245ec3ce918272d0471b5a082af08bb15c48bf61cc903f41aefcb262702a1e7"
+    },
+    {
+      "path": "frontend/src/vite-env.d.ts",
+      "bytes": 38,
+      "sha256": "65996936fbb042915f7b74a200fcdde7e410f32a669b1ab9597cfaa4b0faddb5"
+    },
+    {
+      "path": "frontend/tsconfig.json",
+      "bytes": 402,
+      "sha256": "fedd317542803e74732ad4c6d9eaa8c470bec18fd39c1974cbe42a543527871f"
+    },
+    {
+      "path": "frontend/vite.config.ts",
+      "bytes": 144,
+      "sha256": "e445fc02008b773cedd9f78f3bec20ca0e84c784d0b6abad57d46da614d8c17d"
+    },
+    {
+      "path": "scripts/run_windows.ps1",
+      "bytes": 452,
+      "sha256": "3ebf25e81112e2499ff547ac89860d720c7cfb334f161a7de003ac4861a851f6"
+    },
+    {
+      "path": "scripts/setup_windows.ps1",
+      "bytes": 609,
+      "sha256": "b70620121ef83d162a7ed440ea03583d53951fe958fff7af520b21342013f616"
+    },
+    {
+      "path": "scripts/verify_windows.ps1",
+      "bytes": 686,
+      "sha256": "013a0643726a5fcf6928b6cc81acae876bdfc170b0f1f839ad91ac9e3bb55167"
+    }
+  ]
+}

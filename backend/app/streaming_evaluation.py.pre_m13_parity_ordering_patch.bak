@@ -1,0 +1,432 @@
+﻿"""Bounded scientific metrics and exact causal point-envelope preparation.
+
+Only a channel's annotation table, maximum matching graph and scalar counters
+are retained. Prediction/event rows belong in the runner's immutable fragments.
+The frozen M1.1 evaluator is not modified. Exposure uses a reproducible float64
+summation rather than a batch-dependent sum of rounded partial sums.
+"""
+from __future__ import annotations
+
+import hashlib
+import json
+import math
+
+import numpy as np
+import pandas as pd
+
+from app.evaluation import EventMetricAccumulator, binary_counts, metrics_from_counts
+from app.events import AnnotationMatcher, prepared_annotations, utc_index, utc_timestamp
+
+STATE_VERSION = 1
+
+
+def _plain(value):
+    if isinstance(value, pd.Timestamp):
+        return value.isoformat()
+    if isinstance(value, np.generic):
+        return _plain(value.item())
+    if isinstance(value, dict):
+        return {str(k): _plain(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_plain(v) for v in value]
+    if value is pd.NA or (isinstance(value, float) and math.isnan(value)):
+        return None
+    return value
+
+
+def _identity(value):
+    return hashlib.sha256(json.dumps(_plain(value), sort_keys=True, allow_nan=False,
+                                    separators=(",", ":")).encode()).hexdigest()
+
+
+def _annotation_frame(records, columns=None):
+    frame = pd.DataFrame(records, columns=columns)
+    if frame.empty:
+        for name in ("StartTime", "EndTime", "Category", "ID"):
+            if name not in frame:
+                frame[name] = pd.Series(dtype=object)
+    # Timestamp.isoformat() preserves precision per value. A checkpoint can
+    # therefore mix whole-second and nanosecond ISO strings in the same column;
+    # parse those explicitly before the frozen validator sees typed datetimes.
+    for name in ("StartTime", "EndTime", "OriginalStartTime", "OriginalEndTime"):
+        if name in frame:
+            frame[name] = pd.to_datetime(frame[name], format="mixed", utc=True, errors="raise")
+    return prepared_annotations(frame)
+
+
+class StreamingPointEnvelopes:
+    """Resolve point tolerance using the observation strictly before each point.
+
+    Feed the complete cadence prefix and test chronology. Points before the first
+    observation use its cadence, and points after the last use its cadence, just
+    like ``scientific.cadence_matched_annotations``. Only annotation-sized state
+    is retained; unresolved points survive batch boundaries and checkpoints.
+    """
+
+    def __init__(self, annotations, tolerance_cadences=.5):
+        if not np.isfinite(tolerance_cadences) or tolerance_cadences < 0:
+            raise ValueError("Point tolerance must be finite and nonnegative")
+        self.annotations = prepared_annotations(annotations)
+        self.tolerance_cadences = float(tolerance_cadences)
+        self.points = sorted(self.annotations.index[
+            self.annotations.StartTime == self.annotations.EndTime],
+            key=lambda i: self.annotations.at[i, "StartTime"])
+        self.position = 0
+        self.tolerances = [0.] * len(self.annotations)
+        self.previous_timestamp = None
+        self.previous_cadence = None
+        self.configuration = {"annotations": _plain(self.annotations.to_dict("records")),
+                              "annotation_columns": list(self.annotations.columns),
+                              "tolerance_cadences": self.tolerance_cadences}
+        self.configuration_id = _identity(self.configuration)
+
+    def update(self, cadence):
+        if isinstance(cadence, pd.DataFrame):
+            cadence = cadence.cadence_seconds
+        index = utc_index(cadence.index).as_unit("ns")
+        values = np.asarray(cadence, dtype=np.float64)
+        if values.shape != (len(index),) or not np.isfinite(values).all() or (values <= 0).any():
+            raise ValueError("Cadence must contain positive finite aligned values")
+        if not len(index):
+            return
+        if self.previous_timestamp is not None and index[0] <= self.previous_timestamp:
+            raise ValueError("Point-envelope batches overlap or are out of order")
+        while self.position < len(self.points):
+            row = self.points[self.position]
+            point = self.annotations.at[row, "StartTime"]
+            if point > index[-1]:
+                break
+            prior = index.searchsorted(point, side="left") - 1
+            local = (values[prior] if prior >= 0 else
+                     self.previous_cadence if self.previous_cadence is not None else values[0])
+            delta = pd.Timedelta(seconds=float(local) * self.tolerance_cadences)
+            self.tolerances[row] = delta.total_seconds()
+            self.delta_nanoseconds[row] = int(delta.value)
+            self.position += 1
+        self.previous_timestamp, self.previous_cadence = index[-1], float(values[-1])
+
+    def finish(self):
+        if self.previous_timestamp is None:
+            raise ValueError("Point envelopes require at least one cadence observation")
+        result = self.annotations.copy()
+        result["OriginalStartTime"] = result.StartTime.copy()
+        result["OriginalEndTime"] = result.EndTime.copy()
+        result["PointToleranceSeconds"] = self.tolerances
+        for ordinal, row in enumerate(self.points):
+            if ordinal >= self.position:
+                result.at[row, "PointToleranceSeconds"] = pd.Timedelta(
+                    seconds=self.previous_cadence * self.tolerance_cadences).total_seconds()
+            # Retain Timedelta nanoseconds: .total_seconds() is only reported
+            # metadata and may truncate sub-microsecond precision in pandas.
+            local_seconds = self.tolerances[row] if ordinal < self.position else None
+            if local_seconds is None:
+                delta = pd.Timedelta(seconds=self.previous_cadence * self.tolerance_cadences)
+            else:
+                delta = pd.Timedelta(self.delta_nanoseconds[row], unit="ns")
+            point = self.annotations.at[row, "StartTime"]
+            result.at[row, "StartTime"], result.at[row, "EndTime"] = point-delta, point+delta
+        return result
+
+    @property
+    def delta_nanoseconds(self):
+        # Backing storage is allocated only for annotations, never observations.
+        if not hasattr(self, "_delta_nanoseconds"):
+            self._delta_nanoseconds = [0] * len(self.annotations)
+        return self._delta_nanoseconds
+
+    def to_state(self):
+        return {"version": STATE_VERSION, "kind": type(self).__name__,
+                "configuration": _plain(self.configuration), "configuration_id": self.configuration_id,
+                "position": self.position, "tolerances": list(self.tolerances),
+                "delta_nanoseconds": list(self.delta_nanoseconds),
+                "previous_timestamp": _plain(self.previous_timestamp),
+                "previous_cadence": self.previous_cadence}
+
+    @classmethod
+    def from_state(cls, state, expected_identity=None):
+        _validate_envelope(state, cls.__name__, expected_identity)
+        config = state["configuration"]
+        result = cls(_annotation_frame(config["annotations"], config["annotation_columns"]), config["tolerance_cadences"])
+        if result.configuration_id != state["configuration_id"]:
+            raise ValueError("Restored point-envelope configuration differs")
+        result.position = int(state["position"])
+        result.tolerances = list(state["tolerances"])
+        result._delta_nanoseconds = list(state["delta_nanoseconds"])
+        result.previous_timestamp = utc_timestamp(state["previous_timestamp"]) if state["previous_timestamp"] else None
+        result.previous_cadence = state["previous_cadence"]
+        if not 0 <= result.position <= len(result.points) or len(result.tolerances) != len(result.annotations) or len(result.delta_nanoseconds) != len(result.annotations):
+            raise ValueError("Invalid point-envelope checkpoint bounds")
+        if (not all(np.isfinite(x) and x >= 0 for x in result.tolerances)
+            or not all(isinstance(x, int) and x >= 0 for x in result.delta_nanoseconds)
+            or (result.previous_timestamp is None) != (result.previous_cadence is None)
+            or (result.previous_cadence is not None and (not np.isfinite(result.previous_cadence) or result.previous_cadence <= 0))):
+            raise ValueError("Invalid point-envelope checkpoint values")
+        return result
+
+
+def _validate_envelope(state, kind, expected_identity):
+    if state.get("version") != STATE_VERSION or state.get("kind") != kind:
+        raise ValueError("Unsupported scientific state version/type")
+    actual = _identity(state["configuration"])
+    if actual != state.get("configuration_id") or (expected_identity is not None and actual != expected_identity):
+        raise ValueError("Scientific state configuration identity changed")
+
+
+class _FloatSum:
+    """Error-free float64 partials, bounded by the binary64 exponent range."""
+
+    def __init__(self, partials=()):
+        self.partials = list(partials)
+        if len(self.partials) > 2048 or not all(math.isfinite(x) for x in self.partials):
+            raise ValueError("Invalid exposure summation state")
+
+    def add(self, values):
+        for value in values:
+            x = float(value)
+            index = 0
+            for y in self.partials:
+                if abs(x) < abs(y):
+                    x, y = y, x
+                high = x + y
+                if not math.isfinite(high):
+                    raise ValueError("Observation exposure overflowed float64")
+                low = y - (high-x)
+                if low:
+                    self.partials[index] = low
+                    index += 1
+                x = high
+            self.partials[index:] = [x]
+
+    def result(self):
+        return math.fsum(self.partials)
+
+
+class _EventView:
+    def __init__(self, annotations, labelled):
+        self.accumulator = EventMetricAccumulator(annotations, unlabelled_policy="assume_normal",
+                                                 labelled_channel=labelled)
+        self.overlaps = 0
+        self.all_annotation_overlaps = 0
+
+    def update(self, event, overlaps_all):
+        self.overlaps += bool(self.accumulator.matcher.matching_indices(event))
+        self.all_annotation_overlaps += bool(overlaps_all)
+        self.accumulator.update(event)
+
+    def result(self, exposure):
+        acc = self.accumulator
+        assumed = acc.result(exposure)
+        try:
+            acc.policy = "exclude"
+            supported = acc.result(exposure)
+        finally:
+            acc.policy = "assume_normal"
+        if not len(acc.annotations):
+            assumed["recall"] = assumed["f1"] = supported["recall"] = None
+        matches = assumed["tp"] or 0
+        count = acc.predictions
+        return {"supported_ground_truth": supported, "assumed_normal": assumed,
+                "burden": {"predicted_events": count,
+                    "events_per_observation_day": count*86400/exposure if exposure else None,
+                    "events_overlapping_any_truth": self.overlaps,
+                    "redundant_overlapping_events": self.overlaps-matches if acc.labelled_channel else None,
+                    "events_outside_any_label": count-self.overlaps,
+                    "outside_label_interpretation": "unknown physical truth; assumed false alarms only under the nominal benchmark convention",
+                    "outside_label_scope": "relevant task/category/geometry truth, as in frozen M1.1",
+                    "events_outside_relevant_annotations": count-self.overlaps,
+                    "events_outside_all_annotations": count-self.all_annotation_overlaps,
+                    "events_overlapping_all_annotations": self.all_annotation_overlaps}}
+
+    def to_state(self):
+        acc = self.accumulator
+        return {"predictions": acc.predictions, "overlaps": self.overlaps,
+                "all_annotation_overlaps": self.all_annotation_overlaps,
+                "truth_to_prediction": {str(k): v for k, v in acc.truth_to_prediction.items()},
+                "nodes": {str(k): [_plain(event), list(adjacent)] for k, (event, adjacent) in acc.nodes.items()}}
+
+    def restore(self, state):
+        acc = self.accumulator
+        acc.predictions = int(state["predictions"])
+        self.overlaps = int(state["overlaps"])
+        self.all_annotation_overlaps = int(state["all_annotation_overlaps"])
+        acc.truth_to_prediction = {int(k): int(v) for k, v in state["truth_to_prediction"].items()}
+        acc.nodes = {int(k): (event, list(adjacent)) for k, (event, adjacent) in state["nodes"].items()}
+        if not 0 <= self.overlaps <= acc.predictions or not 0 <= self.all_annotation_overlaps <= acc.predictions:
+            raise ValueError("Invalid event count checkpoint")
+        if len(acc.nodes) > len(acc.annotations) or len(acc.truth_to_prediction) != len(acc.nodes):
+            raise ValueError("Matching checkpoint exceeds annotation bound")
+        if set(acc.truth_to_prediction.values()) != set(acc.nodes):
+            raise ValueError("Matching checkpoint is not one-to-one")
+        for truth, prediction in acc.truth_to_prediction.items():
+            if not 0 <= truth < len(acc.annotations) or prediction not in acc.nodes or not 0 <= prediction < acc.predictions:
+                raise ValueError("Invalid matching checkpoint reference")
+            if truth not in acc.nodes[prediction][1]:
+                raise ValueError("Matching checkpoint edge is absent")
+        for event, adjacent in acc.nodes.values():
+            if adjacent != acc.matcher.matching_indices(event):
+                raise ValueError("Matching checkpoint adjacency differs from annotations")
+
+
+class StreamingScientificEvaluator:
+    """Stream one candidate/task over a fixed test partition and prepared truth.
+
+    ``annotations`` must be produced by StreamingPointEnvelopes.finish() or the
+    frozen cadence_matched_annotations(). Events are returned after correlation
+    for external persistence and are never collected here. Labels are consumed
+    only by this separate evaluation stage, not fitting or scoring.
+    """
+
+    def __init__(self, annotations, test_start, test_end, *, labelled_channel=True,
+                 category=None, gap_task=False, expected_rows=None):
+        self.start, self.end = utc_timestamp(test_start), utc_timestamp(test_end)
+        if self.start > self.end:
+            raise ValueError("Test partition bounds are reversed")
+        ann = prepared_annotations(annotations)
+        required = {"OriginalStartTime", "OriginalEndTime", "PointToleranceSeconds"}
+        if not required.issubset(ann):
+            raise ValueError("Scientific evaluation requires causally prepared point envelopes")
+        for name in ("OriginalStartTime", "OriginalEndTime"):
+            ann[name] = pd.to_datetime(ann[name], format="mixed", utc=True, errors="raise")
+        self.annotations = ann[(ann.EndTime >= self.start) & (ann.StartTime <= self.end)].copy()
+        self.labelled_channel, self.category, self.gap_task = bool(labelled_channel), category, bool(gap_task)
+        if category is not None and category not in {"Anomaly", "Rare Event", "Communication Gap"}:
+            raise ValueError("Invalid evaluation category")
+        self.expected_rows = int(expected_rows) if expected_rows is not None else None
+        if self.expected_rows is not None and self.expected_rows < 1:
+            raise ValueError("Expected test rows must be positive")
+        relevant = self.annotations[self.annotations.Category == "Communication Gap"] if gap_task else self.annotations[self.annotations.Category.isin(["Anomaly", "Rare Event"])]
+        if category is not None:
+            relevant = relevant[relevant.Category == category]
+        self.relevant = relevant
+        self.all_matcher = AnnotationMatcher(self.annotations)
+        self.views = {"event": _EventView(relevant, self.labelled_channel)}
+        if not gap_task:
+            for name in ("Anomaly", "Rare Event"):
+                self.views[f"category:{name}"] = _EventView(relevant[relevant.Category == name], self.labelled_channel)
+            points = relevant.OriginalStartTime == relevant.OriginalEndTime
+            self.views["geometry:point"] = _EventView(relevant[points], self.labelled_channel)
+            self.views["geometry:interval"] = _EventView(relevant[~points], self.labelled_channel)
+        self.rows = self.flagged = self.unlabelled = 0
+        self.counts = dict.fromkeys(("tp", "fp", "tn", "fn", "excluded_unknown"), 0)
+        self.first_timestamp = self.previous_timestamp = None
+        self.exposure = _FloatSum()
+        self.configuration = {"annotations": _plain(self.annotations.to_dict("records")),
+            "annotation_columns": list(self.annotations.columns),
+            "test_start": self.start.isoformat(), "test_end": self.end.isoformat(),
+            "labelled_channel": self.labelled_channel, "category": category,
+            "gap_task": self.gap_task, "expected_rows": self.expected_rows}
+        self.configuration_id = _identity(self.configuration)
+
+    @staticmethod
+    def _mask(index, annotations):
+        mask = np.zeros(len(index), dtype=bool)
+        nanoseconds = index.as_unit("ns").asi8
+        for start, end in zip(annotations.StartTime, annotations.EndTime):
+            left, right = np.searchsorted(nanoseconds, start.value, side="left"), np.searchsorted(nanoseconds, end.value, side="right")
+            mask[left:right] = True
+        return mask
+
+    def update_samples(self, index, flags, cadence_frame):
+        index = utc_index(index).as_unit("ns")
+        flags = np.asarray(flags)
+        if flags.shape != (len(index),) or not np.isin(flags, [0, 1]).all():
+            raise ValueError("Sample flags must be aligned binary values")
+        if not index.equals(utc_index(cadence_frame.index).as_unit("ns")):
+            raise ValueError("Cadence rows must exactly align with evaluated samples")
+        if not len(index):
+            return
+        if index[0] < self.start or index[-1] > self.end or (self.previous_timestamp is not None and index[0] <= self.previous_timestamp):
+            raise ValueError("Evaluation batches overlap or leave the declared test partition")
+        delta = cadence_frame.delta_seconds.to_numpy(dtype=np.float64, copy=True)
+        expected = cadence_frame.previous_cadence_seconds.to_numpy(dtype=np.float64)
+        if self.first_timestamp is None:
+            self.first_timestamp = index[0]
+            delta[0] = np.nan
+        good = np.isfinite(delta) & (delta > 0) & (delta <= 3*expected)
+        self.exposure.add(delta[good])
+        self.previous_timestamp = index[-1]
+        self.rows += len(index)
+        if self.gap_task:
+            return
+        positive = self._mask(index, self.relevant)
+        gaps = self._mask(index, self.annotations[self.annotations.Category == "Communication Gap"])
+        known = ~((gaps & ~positive)) if self.labelled_channel else np.zeros(len(index), dtype=bool)
+        counts = binary_counts(np.where(known, positive.astype(float), np.nan), flags)
+        for key, value in counts.items():
+            self.counts[key] += value
+        self.flagged += int(np.count_nonzero(flags))
+        self.unlabelled += int(np.count_nonzero(~positive))
+
+    def update_event(self, event):
+        correlated = self.all_matcher.correlate(event)
+        all_overlap = bool(self.all_matcher.matching_indices(event))
+        for view in self.views.values():
+            view.update(correlated, all_overlap)
+        return correlated
+
+    def result(self, require_complete=True):
+        if require_complete and (self.first_timestamp != self.start or self.previous_timestamp != self.end or
+            (self.expected_rows is not None and self.rows != self.expected_rows)):
+            raise ValueError("Evaluation does not cover the complete declared test partition")
+        exposure = self.exposure.result()
+        result = {"event": self.views["event"].result(exposure),
+            "observation_seconds": exposure,
+            "elapsed_seconds": (self.previous_timestamp-self.first_timestamp).total_seconds() if self.rows else 0.,
+            "labelled_channel": self.labelled_channel,
+            "point_tolerance": "half of causally confirmed local cadence before each original point",
+            "truth": self.relevant.to_dict("records"), "events_materialized": False,
+            "protocol": "VYOM one-to-one closed-overlap F1; not the official ESA alarming precision / affiliation protocol",
+            "exposure_summation": "batch-invariant float64 partials; last-bit rounding may differ from whole-array numpy.sum"}
+        if self.gap_task:
+            result["sample"] = None
+            return _plain(result)
+        sample = metrics_from_counts(self.counts)
+        positives = self.counts["tp"] + self.counts["fn"]
+        if not positives:
+            sample["recall"] = sample["f1"] = None
+        result["sample"] = {"assumed_normal": sample,
+            "supported_ground_truth": {"labelled_positive_recall": self.counts["tp"]/positives if positives else None,
+                "labelled_positive_samples": positives, "confirmed_negative_samples": 0,
+                "precision": None, "f1": None, "note": "No independently verified normal observations were supplied"},
+            "burden": {"flagged_samples": self.flagged,
+                "flagged_sample_fraction": self.flagged/self.rows if self.rows else None,
+                "unlabelled_samples": self.unlabelled}}
+        result["per_category"] = {name: self.views[f"category:{name}"].result(exposure) for name in ("Anomaly", "Rare Event")}
+        result["per_geometry"] = {name: self.views[f"geometry:{name}"].result(exposure) for name in ("point", "interval")}
+        return _plain(result)
+
+    def to_state(self):
+        return {"version": STATE_VERSION, "kind": type(self).__name__,
+            "configuration": _plain(self.configuration), "configuration_id": self.configuration_id,
+            "rows": self.rows, "flagged": self.flagged, "unlabelled": self.unlabelled,
+            "counts": dict(self.counts), "first_timestamp": _plain(self.first_timestamp),
+            "previous_timestamp": _plain(self.previous_timestamp),
+            "exposure_partials": list(self.exposure.partials),
+            "views": {name: view.to_state() for name, view in self.views.items()}}
+
+    @classmethod
+    def from_state(cls, state, expected_identity=None):
+        _validate_envelope(state, cls.__name__, expected_identity)
+        config = state["configuration"]
+        result = cls(_annotation_frame(config["annotations"], config["annotation_columns"]), config["test_start"], config["test_end"],
+                     labelled_channel=config["labelled_channel"], category=config["category"],
+                     gap_task=config["gap_task"], expected_rows=config["expected_rows"])
+        if result.configuration_id != state["configuration_id"]:
+            raise ValueError("Restored scientific configuration differs")
+        result.rows, result.flagged, result.unlabelled = (int(state[k]) for k in ("rows", "flagged", "unlabelled"))
+        result.counts = {k: int(v) for k, v in state["counts"].items()}
+        if set(result.counts) != {"tp", "fp", "tn", "fn", "excluded_unknown"}:
+            raise ValueError("Invalid sample counter checkpoint fields")
+        if min(result.rows, result.flagged, result.unlabelled, *result.counts.values()) < 0 or result.flagged > result.rows or result.unlabelled > result.rows:
+            raise ValueError("Invalid sample counter checkpoint")
+        if not result.gap_task and sum(result.counts.values()) != result.rows:
+            raise ValueError("Sample checkpoint counts do not cover processed rows")
+        result.first_timestamp = utc_timestamp(state["first_timestamp"]) if state["first_timestamp"] else None
+        result.previous_timestamp = utc_timestamp(state["previous_timestamp"]) if state["previous_timestamp"] else None
+        result.exposure = _FloatSum(state["exposure_partials"])
+        if set(result.views) != set(state["views"]):
+            raise ValueError("Scientific matching views differ")
+        for name, view in result.views.items():
+            view.restore(state["views"][name])
+        return result
+

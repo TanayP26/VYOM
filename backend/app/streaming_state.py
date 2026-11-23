@@ -45,18 +45,17 @@ class StateIntegrityError(ValueError):
 
 
 class StreamingTemporalEventGrouper(TemporalEventGrouper):
-    """Preserve frozen whole-window geometry while deferring quiet-end flushes.
+    """Preserve frozen event geometry while deferring quiet-end flushes.
 
-    Only flagged observations participate in the frozen local-cadence bridge
-    rule. Passing that subsequence through the original implementation prevents
-    its quiet-batch-end flush. The actual input cursor still advances across all
-    quiet observations. A gap too large to bridge closes the previous event when
-    the next flag arrives; an otherwise open event is flushed at true test end.
-    Sample detections remain causal, although event finalization can be delayed.
+    Events are finalized only when a later flagged observation proves that the
+    local cadence bridge has been exceeded, or at the true end of the test
+    stream. ``_finalized_at`` is an internal ordering marker removed before
+    persistence; it never changes detector flags or event geometry.
     """
     def __init__(self, channel, bridge_cadences=2.0):
         super().__init__(channel, bridge_cadences)
         self.finished = False
+        self._finalization_times = []
 
     def update(self, index, flags, scores, cadence_seconds, detector, evidence=None):
         if self.finished:
@@ -71,19 +70,60 @@ class StreamingTemporalEventGrouper(TemporalEventGrouper):
         if (flags.shape != (len(index),) or scores.shape != (len(index),)
                 or not np.isfinite(cadences).all() or (cadences <= 0).any()):
             raise ValueError("Invalid grouping arrays")
-        positions = np.flatnonzero(flags)
-        if len(positions):
-            result = super().update(index[positions], flags[positions], scores[positions],
-                                    cadences[positions], detector, evidence)
-        else:
-            result = []
+
+        result = []
+        for i in np.flatnonzero(flags):
+            if not np.isfinite(scores[i]):
+                raise ValueError("Flagged scores must be finite")
+            timestamp = index[i]
+            if self.current is not None:
+                gap = (timestamp - pd.Timestamp(self.current["end"])).total_seconds()
+                if gap > self.bridge_cadences * max(cadences[i], self.last_flag_cadence):
+                    for event in self.flush():
+                        self._finalization_times.append(timestamp.isoformat())
+                        result.append(event)
+            if self.current is None:
+                self.current = {
+                    "channel": self.channel,
+                    "start": timestamp.isoformat(),
+                    "end": timestamp.isoformat(),
+                    "duration_seconds": 0.0,
+                    "peak_score": float(scores[i]),
+                    "sample_count": 0,
+                    "detector": detector,
+                    "detectors": [detector],
+                    "evidence": {
+                        **(evidence or {}),
+                        "bridge_cadences": self.bridge_cadences,
+                        "peak_timestamp": timestamp.isoformat(),
+                    },
+                }
+            self.current["end"] = timestamp.isoformat()
+            self.current["duration_seconds"] = (
+                timestamp - pd.Timestamp(self.current["start"])
+            ).total_seconds()
+            self.current["sample_count"] += 1
+            if scores[i] > self.current["peak_score"]:
+                self.current["peak_score"] = float(scores[i])
+                self.current["evidence"]["peak_timestamp"] = timestamp.isoformat()
+            self.last_flag_cadence = cadences[i]
+
         if len(index):
             self.last_timestamp = index[-1]
         return result
 
     def finish(self):
         self.finished = True
-        return self.flush()
+        finalized_at = self.last_timestamp.isoformat() if self.last_timestamp is not None else None
+        result = self.flush()
+        for event in result:
+            self._finalization_times.append(finalized_at or event["end"])
+        return result
+
+    def take_finalization_times(self):
+        times = list(self._finalization_times)
+        self._finalization_times.clear()
+        return times
 
 
 _TYPES = {}
