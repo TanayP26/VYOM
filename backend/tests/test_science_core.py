@@ -19,7 +19,8 @@ def test_event_state_crosses_batch_boundary():
     idx=pd.date_range("2026-01-01",periods=6,freq="30s",tz="UTC")
     g=EventAccumulator("channel_x","temporal_point",2)
     assert g.update(idx[:2],[1,1],[4,5],[30,30])==[]
-    out=g.update(idx[2:4],[1,0],[6,0],[30,30])
+    assert g.update(idx[2:4],[1,0],[6,0],[30,30])==[]
+    out=g.finish()
     assert len(out)==1 and out[0]["count"]==3 and out[0]["peak_score"]==6
 
 def test_event_breaks_on_large_time_gap():

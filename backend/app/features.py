@@ -142,9 +142,13 @@ class TemporalFeatureBuilder:
             count = np.sum(np.isfinite(window), axis=1)
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", RuntimeWarning)
+                # Preserve the frozen NumPy code paths for median and quartiles
+                # bit-for-bit. Only the MAD temporary is optimized away.
                 median = np.nanmedian(window, axis=1)
-                mad = np.nanmedian(np.abs(window - median[:, None]), axis=1)
                 quartiles = np.nanquantile(window, [.25, .75], axis=1)
+                np.subtract(window, median[:, None], out=window)
+                np.abs(window, out=window)
+                mad = np.nanmedian(window, axis=1, overwrite_input=True)
             too_short = count < self.config.min_periods
             for destination, column in zip(result, (median, mad, quartiles[0], quartiles[1])):
                 column[too_short] = np.nan

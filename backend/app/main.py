@@ -11,7 +11,7 @@ from sqlalchemy.orm import Session
 from app.core import settings
 from app.db import Base,engine,get_db,ensure_schema,AnalysisRun,DetectionEvent,KnowledgeDocument
 from app.dataset import mission_summary,channel_catalog,channel_annotations,metadata,store_root,dataset_root
-from app.service import execute_run,telemetry_sample
+from app.service import execute_run,telemetry_sample,reserve_run,release_run,active_run_id
 from app.knowledge import upsert,answer,external_research
 
 cfg=settings()
@@ -100,17 +100,31 @@ def start_run(req:RunRequest,bg:BackgroundTasks,db:Session=Depends(get_db)):
     unknown=[x for x in selected if x not in available]
     if unknown:raise HTTPException(422,f"Channels unavailable in telemetry store: {unknown}")
     r=AnalysisRun(kind="retrospective",scope="all76" if req.full_mission else "selected",status="queued",processed=0,total=len(selected),configuration={"channels":selected,"batch_rows":req.batch_rows,"protocol":"frozen VYOM 60/20/20 retrospective"})
-    db.add(r);db.commit();db.refresh(r);bg.add_task(execute_run,r.id)
+    db.add(r);db.flush()
+    if not reserve_run(r.id):
+        active=active_run_id()
+        db.rollback()
+        raise HTTPException(409,f"Run #{active} is already active. Wait for it to finish before launching another analysis.")
+    try:
+        db.commit();db.refresh(r)
+    except Exception:
+        release_run(r.id)
+        raise
+    bg.add_task(execute_run,r.id)
     return {"run_id":r.id,"status":r.status,"channels":selected,"full_mission":req.full_mission}
 
 @app.get("/api/analysis/runs")
 def runs(limit:int=Query(20,ge=1,le=100),db:Session=Depends(get_db)):
     rows=db.query(AnalysisRun).order_by(desc(AnalysisRun.id)).limit(limit).all()
-    return [{"id":r.id,"kind":r.kind,"scope":r.scope,"status":r.status,"processed":r.processed,"total":r.total,"summary":r.summary,"configuration":r.configuration,"artifact_path":r.artifact_path,"error":r.error,"started":r.started.isoformat() if r.started else None,"completed":r.completed.isoformat() if r.completed else None} for r in rows]
+    return [{"id":r.id,"kind":r.kind,"scope":r.scope,"status":r.status,"processed":r.processed,"total":r.total,"summary":r.summary,"configuration":r.configuration,"artifact_path":r.artifact_path,"error":r.error.splitlines()[0] if r.error else None,"started":r.started.isoformat() if r.started else None,"completed":r.completed.isoformat() if r.completed else None} for r in rows]
 
 @app.get("/api/events")
 def events(run_id:int|None=None,channel:str|None=None,severity:str|None=None,detector:str|None=None,limit:int=Query(250,ge=1,le=2000),db:Session=Depends(get_db)):
     q=db.query(DetectionEvent)
+    if run_id is None:
+        latest=db.query(AnalysisRun).filter(AnalysisRun.status=="completed").order_by(desc(AnalysisRun.id)).first()
+        if latest is not None:
+            run_id=latest.id
     if run_id is not None:q=q.filter(DetectionEvent.run_id==run_id)
     if channel:q=q.filter(DetectionEvent.channel==channel)
     if severity:q=q.filter(DetectionEvent.severity==severity)
@@ -133,8 +147,16 @@ def events(run_id:int|None=None,channel:str|None=None,severity:str|None=None,det
 def reports():
     root=cfg.resolve(cfg.artifact_dir);result=[]
     if root.exists():
-        for p in sorted(root.rglob("report.json"),key=lambda x:x.stat().st_mtime,reverse=True)[:250]:
-            try:d=json.loads(p.read_text(encoding="utf-8"));result.append({"path":str(p),"channel":d.get("channel"),"status":d.get("status"),"events":d.get("events"),"metrics":d.get("event_metrics_nominal_complement"),"resources":d.get("resources")})
+        product=list(root.rglob("product_summary.json"))
+        paths=product if product else list(root.rglob("report.json"))
+        for p in sorted(paths,key=lambda x:x.stat().st_mtime,reverse=True)[:250]:
+            try:
+                d=json.loads(p.read_text(encoding="utf-8"))
+                result.append({"path":str(p),"channel":d.get("channel"),"status":d.get("status"),
+                    "events":d.get("incidents",d.get("events")),
+                    "metrics":d.get("event_metrics_nominal_complement"),
+                    "resources":d.get("resources"),
+                    "engine":d.get("engine"),"detector_evidence":d.get("detector_evidence")})
             except Exception:pass
     return {"reports":result,"count":len(result)}
 

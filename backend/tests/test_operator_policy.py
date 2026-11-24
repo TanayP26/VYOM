@@ -2,58 +2,56 @@ import numpy as np
 import pytest
 
 from app.operator_policy import (
-    build_combined_policy_candidates,
+    m13_baseline_flags,
     operator_policy_metadata,
+    temporal_first_operator_flags,
 )
 
 
-def test_active_operator_policy_is_temporal_first_and_if_cannot_create_incidents():
-    temporal = np.array([True, False, False, True, False])
-    isolation = np.array([False, True, True, True, True])
-    ratio = np.array([0.2, 0.75, 1.2, 0.4, np.nan])
+def test_temporal_first_operator_flags_are_exact_copy():
+    temporal = np.array([True, False, True, False], dtype=bool)
+    actual = temporal_first_operator_flags(temporal)
+    np.testing.assert_array_equal(actual, temporal)
+    assert actual is not temporal
 
-    result = build_combined_policy_candidates(temporal, isolation, ratio)
 
-    np.testing.assert_array_equal(result["combined"], temporal)
+def test_isolation_forest_cannot_create_active_operator_incident():
+    temporal = np.array([False, False, True, False], dtype=bool)
+    isolation = np.array([True, True, True, True], dtype=bool)
+    ratio = np.array([0.75, 1.25, 0.1, np.nan], dtype=float)
+
+    active = temporal_first_operator_flags(temporal)
+    baseline = m13_baseline_flags(temporal, isolation, ratio)
+
+    np.testing.assert_array_equal(active, [False, False, True, False])
+    np.testing.assert_array_equal(baseline, [True, True, True, False])
+
+
+def test_baseline_rule_rejects_nonfinite_ratio_for_if_only_path():
+    temporal = np.array([False, False, True], dtype=bool)
+    isolation = np.array([True, True, True], dtype=bool)
+    ratio = np.array([np.nan, np.inf, np.nan], dtype=float)
     np.testing.assert_array_equal(
-        result["combined_m13_baseline"],
-        np.array([True, True, True, True, False]),
-    )
-    np.testing.assert_array_equal(
-        result["combined_if_full_threshold"],
-        np.array([True, False, True, True, False]),
-    )
-
-
-def test_nonfinite_temporal_ratio_never_corroborates_isolation_forest():
-    result = build_combined_policy_candidates(
+        m13_baseline_flags(temporal, isolation, ratio),
         [False, False, True],
-        [True, True, True],
-        [np.nan, np.inf, np.nan],
     )
-    np.testing.assert_array_equal(result["combined"], [False, False, True])
-    np.testing.assert_array_equal(result["combined_m13_baseline"], [False, False, True])
-    np.testing.assert_array_equal(result["combined_if_full_threshold"], [False, False, True])
 
 
 @pytest.mark.parametrize(
     "temporal,isolation,ratio",
     [
-        ([[True]], [True], [1.2]),
-        ([True, False], [True], [1.2]),
-        ([True], [True], [1.2, 0.8]),
+        ([[True]], [True], [1.0]),
+        ([True, False], [True], [1.0]),
+        ([True], [True], [1.0, 2.0]),
     ],
 )
-def test_policy_rejects_non_1d_or_misaligned_inputs(temporal, isolation, ratio):
+def test_baseline_rejects_bad_shapes(temporal, isolation, ratio):
     with pytest.raises(ValueError):
-        build_combined_policy_candidates(temporal, isolation, ratio)
+        m13_baseline_flags(temporal, isolation, ratio)
 
 
-def test_policy_metadata_preserves_baseline_and_discloses_validation_boundary():
-    metadata = operator_policy_metadata()
-    assert metadata["version"] == "m1.3.1-temporal-first"
-    assert metadata["active_rule"] == "temporal_point_flag OR persistent_temporal_interval_flag"
-    assert metadata["preserved_baseline"]["active"] is False
-    assert metadata["research_challenger"]["active"] is False
-    assert "Run #10 B" in metadata["test_partition_use"]
-    assert "not external blind validation" in metadata["validation_status"]
+def test_metadata_discloses_scientific_boundary():
+    meta = operator_policy_metadata()
+    assert meta["version"] == "m1.3.1-temporal-first"
+    assert "Run #10 B" in meta["selection_basis"]
+    assert "fresh predeclared B1" in meta["validation_status"]

@@ -9,7 +9,8 @@ from sklearn.ensemble import IsolationForest
 from sklearn.preprocessing import RobustScaler
 
 from app.dataset import channel_parquet, channel_annotations, metadata
-from app.operator_policy import build_combined_policy_candidates, operator_policy_metadata
+from app.operator_policy import operator_policy_metadata, temporal_first_operator_flags
+from app.cadence import CadenceConfig, SamplingRegimeTracker
 
 @dataclass(frozen=True)
 class Protocol:
@@ -107,49 +108,85 @@ class ParquetStream:
         return next(self.batches(row,row+1)).index[0]
 
 class AdaptiveCadence:
+    """Product-facing wrapper around the tested M1.3 causal regime tracker.
+
+    Large persistent cadence changes are held pending and can become a new
+    regime; they are not emitted as communication-gap candidates merely
+    because the new cadence is > gap_factor times the old cadence.
+    """
     def __init__(self, initial:float, tolerance=.05, confirm=8, gap_factor=3.0):
-        self.current=float(initial); self.tolerance=tolerance; self.confirm=confirm; self.gap_factor=gap_factor
-        self.prev=None; self.candidate=None; self.count=0
-    def update(self,index:pd.DatetimeIndex):
-        out=np.full(len(index),self.current,dtype=float); gaps=[]
-        for i,ts in enumerate(index):
-            if self.prev is None: self.prev=ts; out[i]=self.current; continue
-            d=(ts-self.prev).total_seconds(); previous=self.current
-            if d>previous*self.gap_factor:
-                gaps.append({"start":(self.prev+pd.Timedelta(1,'ns')).isoformat(),"end":(ts-pd.Timedelta(1,'ns')).isoformat(),"elapsed_seconds":d,"expected_cadence_seconds":previous})
-            similar=abs(d-previous)<=max(1e-9,abs(previous)*self.tolerance)
-            if not similar and d>0 and d<=previous*self.gap_factor:
-                if self.candidate is not None and abs(d-self.candidate)<=max(1e-9,abs(self.candidate)*self.tolerance): self.count+=1
-                else:self.candidate=d;self.count=1
-                if self.count>=self.confirm:
-                    self.current=float(self.candidate);self.candidate=None;self.count=0
-            else:
-                self.candidate=None;self.count=0
-            out[i]=self.current; self.prev=ts
-        return out,gaps
+        self._tracker = SamplingRegimeTracker(
+            initial,
+            CadenceConfig(
+                relative_tolerance=tolerance,
+                confirmation_samples=confirm,
+                gap_factor=gap_factor,
+            ),
+        )
+
+    @property
+    def current(self):
+        return self._tracker.cadence_seconds
+
+    def update(self, index:pd.DatetimeIndex):
+        frame = self._tracker.transform(index)
+        return frame.cadence_seconds.to_numpy(dtype=float), self._tracker.drain_gaps()
+
+    def finish(self):
+        return self._tracker.finish()
+
+    def regimes(self):
+        return self._tracker.regimes()
 
 class EventAccumulator:
+    """Batch-invariant cadence-aware event grouper for product detections.
+
+    Quiet samples do not close an event immediately. The next flagged sample
+    determines whether the prior event can be bridged. This mirrors the frozen
+    M1.3 event geometry and avoids one-event-per-flag fragmentation.
+    """
     def __init__(self,channel:str,detector:str,bridge=2.0):
         self.channel=channel;self.detector=detector;self.bridge=bridge;self.open=None
+        self.last_timestamp=None
+
     def update(self,index,flags,scores,cadences):
+        index=pd.DatetimeIndex(index)
+        flags=np.asarray(flags,bool);scores=np.asarray(scores,float)
+        cadences=np.asarray(cadences,float)
+        if len(index)!=len(flags) or len(index)!=len(scores) or len(index)!=len(cadences):
+            raise ValueError("Event grouping arrays must have identical lengths")
+        if len(index) and self.last_timestamp is not None and index[0]<=self.last_timestamp:
+            raise ValueError("Event grouping batches must be chronological and non-overlapping")
         emitted=[]
-        for ts,flag,score,cad in zip(index,np.asarray(flags,bool),np.asarray(scores,float),np.asarray(cadences,float)):
-            if flag:
-                if self.open is None:
-                    self.open={"channel":self.channel,"detector":self.detector,"start":ts,"end":ts,"peak_time":ts,"peak_score":float(score),"count":1,"last_cadence":float(cad)}
-                elif (ts-self.open["end"]).total_seconds()<=self.bridge*max(float(cad),self.open["last_cadence"]):
-                    self.open["end"]=ts;self.open["count"]+=1;self.open["last_cadence"]=float(cad)
-                    if score>self.open["peak_score"]:self.open["peak_score"]=float(score);self.open["peak_time"]=ts
-                else:
-                    emitted.append(self._finish()); self.open={"channel":self.channel,"detector":self.detector,"start":ts,"end":ts,"peak_time":ts,"peak_score":float(score),"count":1,"last_cadence":float(cad)}
-            elif self.open is not None:
-                emitted.append(self._finish())
+        for pos in np.flatnonzero(flags):
+            ts=index[pos];score=float(scores[pos]);cad=float(cadences[pos])
+            if not np.isfinite(score) or not np.isfinite(cad) or cad<=0:
+                raise ValueError("Flagged event score/cadence must be finite and cadence positive")
+            if self.open is not None:
+                gap=(ts-self.open["end"]).total_seconds()
+                if gap>self.bridge*max(cad,self.open["last_cadence"]):
+                    emitted.append(self._finish())
+            if self.open is None:
+                self.open={"channel":self.channel,"detector":self.detector,
+                    "start":ts,"end":ts,"peak_time":ts,"peak_score":score,
+                    "count":1,"last_cadence":cad}
+            else:
+                self.open["end"]=ts;self.open["count"]+=1;self.open["last_cadence"]=cad
+                if score>self.open["peak_score"]:
+                    self.open["peak_score"]=score;self.open["peak_time"]=ts
+        if len(index):
+            self.last_timestamp=index[-1]
         return emitted
+
     def _finish(self):
         e=self.open;self.open=None
-        e["start"]=e["start"].isoformat();e["end"]=e["end"].isoformat();e["peak_time"]=e["peak_time"].isoformat();
-        e["duration_seconds"]=(pd.Timestamp(e["end"])-pd.Timestamp(e["start"])).total_seconds();e.pop("last_cadence",None);return e
-    def finish(self): return [self._finish()] if self.open else []
+        e["start"]=e["start"].isoformat();e["end"]=e["end"].isoformat();e["peak_time"]=e["peak_time"].isoformat()
+        e["duration_seconds"]=(pd.Timestamp(e["end"])-pd.Timestamp(e["start"])).total_seconds()
+        e.pop("last_cadence",None)
+        return e
+
+    def finish(self):
+        return [self._finish()] if self.open else []
 
 
 def initial_cadence(stream:ParquetStream, stop:int)->float:
@@ -269,8 +306,32 @@ def run_channel(channel:str,output:Path,batch_rows=5000,protocol:Protocol=PROTOC
     groupers={k:EventAccumulator(channel,k,protocol.event_bridge_cadences) for k in ("temporal_point","temporal_interval","combined","isolation_forest","timestamp_gap")}
     events=[]; test_rows=0; flagged=0
     sample_tp=sample_fp=sample_fn=sample_tn=0
-    baseline_flagged=full_threshold_flagged=0
     exposure_seconds=0.0; exposure_prev=None
+
+    def add_gap_candidates(gaps):
+        for g in gaps:
+            start = pd.Timestamp(g["start"])
+            end = pd.Timestamp(g["end"])
+            if end < test_start or start > test_end:
+                continue
+            score = g["elapsed_seconds"] / max(g["expected_cadence_seconds"], 1e-9)
+            events.append({
+                "channel": channel,
+                "detector": "timestamp_gap",
+                "start": g["start"],
+                "end": g["end"],
+                "peak_time": end.isoformat(),
+                "peak_score": score,
+                "count": 0,
+                "duration_seconds": g["elapsed_seconds"],
+                "evidence": {
+                    "cause": "unknown",
+                    "expected_cadence_seconds": g["expected_cadence_seconds"],
+                    "resolution": g.get("resolution"),
+                    "resolved_at": g.get("resolved_at"),
+                },
+            })
+
     for s in stream.batches(valid,n):
         cds,gaps=cadence.update(s.index);p,i,prev=temporal_scores(s,stats,prev)
         point=p>point_t; interval=np.zeros(len(s),bool)
@@ -281,14 +342,8 @@ def run_channel(channel:str,output:Path,batch_rows=5000,protocol:Protocol=PROTOC
             if persistent>=protocol.persistence:active=True
             interval[idx]=active
         feats=np.c_[s.to_numpy(float),p,i]; iso_score=-iso.decision_function(scaler.transform(feats)); iso_flag=iso.predict(scaler.transform(feats))==-1
-        temporal_flag=point|interval
-        temporal_ratio=np.maximum(p/max(point_t,1e-9),i/max(interval_t,1e-9))
-        temporal_event_score=np.fmax(p/max(point_t,1e-9),i/max(interval_t,1e-9))
-        policy_candidates=build_combined_policy_candidates(temporal_flag,iso_flag,temporal_ratio)
-        combined=policy_candidates["combined"]
-        baseline_flagged+=int(policy_candidates["combined_m13_baseline"].sum())
-        full_threshold_flagged+=int(policy_candidates["combined_if_full_threshold"].sum())
-        for name,flags,scores in (("temporal_point",point,p),("temporal_interval",interval,i),("isolation_forest",iso_flag,iso_score),("combined",combined,temporal_event_score)):
+        combined=temporal_first_operator_flags(point|interval)
+        for name,flags,scores in (("temporal_point",point,p),("temporal_interval",interval,i),("isolation_forest",iso_flag,iso_score),("combined",combined,np.fmax(p/max(point_t,1e-9),i/max(interval_t,1e-9)))):
             events.extend(groupers[name].update(s.index,flags,scores,cds)); flagged+=int(flags.sum()) if name=="combined" else 0
         # Sample metrics are assumption-dependent and only defined on labelled Target=YES channels.
         positive=np.zeros(len(s),dtype=bool)
@@ -307,11 +362,10 @@ def run_channel(channel:str,output:Path,batch_rows=5000,protocol:Protocol=PROTOC
         if len(times)>1:
             ds=np.diff(times.view("i8"))/1e9; exposure_seconds+=float(ds[(ds>0)&(ds<=3*cds[1:])].sum())
         exposure_prev=times[-1]
-        for g in gaps:
-            ts=pd.Timestamp(g["end"]);score=g["elapsed_seconds"]/max(g["expected_cadence_seconds"],1e-9)
-            events.append({"channel":channel,"detector":"timestamp_gap","start":g["start"],"end":g["end"],"peak_time":ts.isoformat(),"peak_score":score,"count":0,"duration_seconds":g["elapsed_seconds"],"evidence":{"cause":"unknown","expected_cadence_seconds":g["expected_cadence_seconds"]}})
+        add_gap_candidates(gaps)
         test_rows+=len(s)
         if progress:progress(test_rows,n-valid)
+    add_gap_candidates(cadence.finish())
     for g in groupers.values():events.extend(g.finish())
     events=correlate(events,ann,cadence0)
     for e in events:e["severity"]=severity(float(e["peak_score"]));e.setdefault("evidence",{})
@@ -335,7 +389,7 @@ def run_channel(channel:str,output:Path,batch_rows=5000,protocol:Protocol=PROTOC
     sample_precision=sample_tp/(sample_tp+sample_fp) if labelled_channel and sample_tp+sample_fp else (0.0 if labelled_channel else None)
     sample_recall=sample_tp/(sample_tp+sample_fn) if labelled_channel and sample_tp+sample_fn else None
     sample_f1=2*sample_precision*sample_recall/(sample_precision+sample_recall) if sample_precision is not None and sample_recall is not None and sample_precision+sample_recall else (0.0 if sample_recall is not None else None)
-    report={"channel":channel,"status":"completed","rows":n,"split":{"train_rows":train,"validation_rows":valid-train,"test_rows":n-valid,"test_start":test_start.isoformat(),"test_end":test_end.isoformat()},"test_rows":test_rows,"events":len(events),"combined_events":len(combined),"combined_flagged_samples":flagged,"operator_policy":operator_policy_metadata(),"policy_diagnostics":{"active_temporal_first_flagged_samples":flagged,"m13_baseline_half_threshold_flagged_samples":baseline_flagged,"full_threshold_challenger_flagged_samples":full_threshold_flagged,"interpretation":"Alternative policy counts are diagnostics only; active operator incidents use temporal flags only."},"sample_metrics_nominal_complement":{"available":labelled_channel,"tp":sample_tp if labelled_channel else None,"fp":sample_fp if labelled_channel else None,"fn":sample_fn if labelled_channel else None,"tn":sample_tn if labelled_channel else None,"precision":sample_precision,"recall":sample_recall,"f1":sample_f1,"confirmed_negative_samples":0,"interpretation":"Assumption-dependent on labelled channels; unannotated does not mean independently confirmed physical normal."},"event_metrics_nominal_complement":{"precision":precision if labelled_channel else None,"recall":recall,"f1":f1 if labelled_channel else None,"matched":matched_pred,"truth":len(truth),"false_events_per_observation_day":((len(combined)-matched_pred)*86400/exposure_seconds) if labelled_channel and exposure_seconds else None,"note":"VYOM closed-overlap one-to-one metric; not ESA official alarming/affiliation metric"},"communication_gap":{"predicted":len(gap_predictions),"truth":len(gap_truth),"matched":gap_tp,"recall":gap_tp/len(gap_truth) if len(gap_truth) else None},"resources":{"wall_seconds":time.perf_counter()-started,"observed_test_exposure_seconds":exposure_seconds},"fitted":frozen,"scientific_limits":["Unannotated periods follow the benchmark nominal-complement convention, not independently confirmed physical normality.","Target=NO is never used as a supervised normal class.","Retrospective benchmark results are not external blind validation."]}
+    report={"channel":channel,"status":"completed","rows":n,"split":{"train_rows":train,"validation_rows":valid-train,"test_rows":n-valid,"test_start":test_start.isoformat(),"test_end":test_end.isoformat()},"test_rows":test_rows,"events":len(events),"combined_events":len(combined),"combined_flagged_samples":flagged,"cadence_regimes":cadence.regimes(),"sample_metrics_nominal_complement":{"available":labelled_channel,"tp":sample_tp if labelled_channel else None,"fp":sample_fp if labelled_channel else None,"fn":sample_fn if labelled_channel else None,"tn":sample_tn if labelled_channel else None,"precision":sample_precision,"recall":sample_recall,"f1":sample_f1,"confirmed_negative_samples":0,"interpretation":"Assumption-dependent on labelled channels; unannotated does not mean independently confirmed physical normal."},"event_metrics_nominal_complement":{"precision":precision if labelled_channel else None,"recall":recall,"f1":f1 if labelled_channel else None,"matched":matched_pred,"truth":len(truth),"false_events_per_observation_day":((len(combined)-matched_pred)*86400/exposure_seconds) if labelled_channel and exposure_seconds else None,"note":"VYOM closed-overlap one-to-one metric; not ESA official alarming/affiliation metric"},"communication_gap":{"predicted":len(gap_predictions),"truth":len(gap_truth),"matched":gap_tp,"recall":gap_tp/len(gap_truth) if len(gap_truth) else None},"resources":{"wall_seconds":time.perf_counter()-started,"observed_test_exposure_seconds":exposure_seconds},"fitted":frozen,"scientific_limits":["Unannotated periods follow the benchmark nominal-complement convention, not independently confirmed physical normality.","Target=NO is never used as a supervised normal class.","Retrospective benchmark results are not external blind validation."]}
     with (output/"events.jsonl").open('w',encoding='utf-8') as f:
         for e in events:f.write(json.dumps(e,default=str)+"\n")
     (output/"report.json").write_text(json.dumps(report,indent=2,default=str),encoding='utf-8')

@@ -23,8 +23,7 @@ This prevents ordinary quantized telemetry steps from being divided by a machine
 - Temporal point score: abrupt change relative to training-only change scale.
 - Temporal interval score: deviation relative to training-only robust scale.
 - Isolation Forest: bounded deterministic training sample; unsupervised comparator.
-- Combined (M1.3.1 operator policy): temporal point OR persistent temporal interval flag. Isolation Forest remains a separate comparator and cannot create operator incidents.
-- The exact M1.3.0 half-threshold rule is preserved as combined_m13_baseline; a full-threshold IF challenger is research-only.
+- Combined: temporal evidence plus IF only when temporally corroborated.
 - Timestamp gaps: cadence-relative missing-time candidates; they do not establish communication failure.
 
 ## Calibration
@@ -45,4 +44,4 @@ VYOM's event metric is one-to-one closed-interval overlap. It must not be presen
 
 ## Validation status
 
-M1.3.1 adopts a temporal-first operator incident policy based on development-exposed A diagnostics. Run #10 B was used only to diagnose the M1.3.0 half-threshold mechanism and was not used to select a threshold. The M1.3.0 rule remains available as a named comparator; the full-threshold IF rule is a research challenger only. A fresh, predeclared B1 Target=YES evaluation is required before claiming improved held-out performance. The source repository completed all-channel ingestion/integrity and bounded detector diagnostics before this product consolidation. A full 76-channel benchmark should be rerun locally with this final distribution before quoting final product metrics.
+The source repository completed all-channel ingestion/integrity and bounded detector diagnostics before this product consolidation. A full 76-channel benchmark should be rerun locally with this final distribution before quoting final product metrics.

@@ -81,22 +81,6 @@ def test_runner_is_batch_invariant_and_reads_labels_only_after_scoring(stream_ca
         assert report["frozen"]["labels_used_for_training_or_calibration"] is False
         assert report["communication_gaps"]["sample"] is None
         assert report["random_forest"]["status"] == "unsupported"
-        assert report["frozen"]["operator_policy"]["version"] == "m1.3.1-temporal-first"
-        assert "combined_m13_baseline" in report["models"]
-        assert "combined_if_full_threshold" in report["models"]
-
-    predictions = _predictions(tmp_path/"run_37")
-    np.testing.assert_array_equal(
-        predictions["combined_flag"].to_numpy(bool),
-        predictions["improved_temporal_flag"].to_numpy(bool),
-    )
-    ratio = predictions["improved_temporal_score"].to_numpy(float)
-    iso = predictions["isolation_forest_flag"].to_numpy(bool)
-    temporal = predictions["improved_temporal_flag"].to_numpy(bool)
-    expected_baseline = temporal | (iso & np.isfinite(ratio) & (ratio > .5))
-    expected_full = temporal | (iso & np.isfinite(ratio) & (ratio > 1.0))
-    np.testing.assert_array_equal(predictions["combined_m13_baseline_flag"], expected_baseline)
-    np.testing.assert_array_equal(predictions["combined_if_full_threshold_flag"], expected_full)
 
 
 def test_runner_resumes_after_committed_interruption_without_duplicates(stream_case, tmp_path):

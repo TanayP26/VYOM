@@ -9,7 +9,7 @@ import time
 import pandas as pd
 
 from app.artifacts import file_sha256
-from app.storage import atomic_json
+from app.storage import atomic_json, atomic_replace
 from app.streaming_state import encode_state, decode_state
 
 
@@ -20,7 +20,7 @@ def atomic_bytes(path, payload):
         stream.write(payload)
         stream.flush()
         os.fsync(stream.fileno())
-    os.replace(temporary, path)
+    atomic_replace(temporary, path)
 
 
 class FragmentJournal:
@@ -92,7 +92,7 @@ class FragmentJournal:
             frame.to_parquet(temporary, engine="pyarrow", compression="zstd", row_group_size=max(1, len(frame)))
             with temporary.open("r+b") as stream:
                 os.fsync(stream.fileno())
-            os.replace(temporary, path)
+            atomic_replace(temporary, path)
             fragments.append({"kind": kind, "path": path.name, "sha256": file_sha256(path), "rows": len(frame), "bytes": path.stat().st_size})
         if events is not None:
             path = self._path(f"{prefix}-events.jsonl")
