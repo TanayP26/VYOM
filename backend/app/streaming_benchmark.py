@@ -14,6 +14,7 @@ import pyarrow.parquet as pq
 from app.artifacts import ResourceMonitor, file_sha256, fingerprint, run_lock, utc_now
 from app.cadence import SamplingRegimeTracker, training_cadence
 from app.calibration import DetectionPolicy
+from app.operator_policy import build_combined_policy_candidates, operator_policy_metadata
 from app.detectors import BoundedTrainingSampler, IsolationForestDetector, StatisticalDetector, _valid
 from app.features import FeatureConfig, TemporalFeatureBuilder
 from app.storage import atomic_json
@@ -23,7 +24,7 @@ from app.streaming_checkpoint import FragmentJournal
 from app.streaming_state import StreamingTemporalEventGrouper
 from app.streaming_statistics import fit_temporal_stream, calibrate_stream
 
-MODELS = ("robust_statistical", "isolation_forest", "temporal_point", "temporal_interval", "improved_temporal", "combined")
+MODELS = ("robust_statistical", "isolation_forest", "temporal_point", "temporal_interval", "improved_temporal", "combined", "combined_m13_baseline", "combined_if_full_threshold")
 PROTOCOL = {
     "version": 1, "fitting": "frozen_procedure_new_channel_specific_fitted_identity",
     "train_fraction": .6, "validation_fraction": .2, "seed": 42,
@@ -138,7 +139,7 @@ def _legacy(state, raw):
         if "max_history_rows" not in str(exc):
             raise
         state["legacy_failed"] = True
-        for name in ("robust_statistical", "isolation_forest", "combined"):
+        for name in ("robust_statistical", "isolation_forest", "combined_m13_baseline", "combined_if_full_threshold"):
             state["unsupported"][name] = {"status": "unsupported", "reason": str(exc),
                 "at": raw.index[0].isoformat(), "no_silent_history_cap_change": True}
         return None
@@ -161,17 +162,28 @@ def _scores(state, raw, timing):
     legacy = _legacy(state, raw)
     stat = state["stat"].score(legacy) if legacy is not None else None
     iso = state["iso"].score(legacy) if legacy is not None and state.get("iso") is not None else None
+    iso_flags = iso.iforest_flag if iso is not None else np.zeros(len(raw), dtype=bool)
+    policy_candidates = build_combined_policy_candidates(flags.temporal_flag, iso_flags, ratio)
     candidates = {
         "temporal_point": (flags.point_flag, temporal.point_score),
         "temporal_interval": (flags.interval_flag, temporal.interval_score),
         "improved_temporal": (flags.temporal_flag, ratio),
+        "combined": (policy_candidates["combined"], np.fmax(
+            temporal.point_score/state["point_cal"].threshold,
+            temporal.interval_score/state["interval_cal"].threshold,
+        )),
     }
     if stat is not None:
         candidates["robust_statistical"] = (stat.statistical_flag, stat.statistical_score)
     if iso is not None:
         candidates["isolation_forest"] = (iso.iforest_flag, iso.iforest_score)
-        candidates["combined"] = (flags.temporal_flag | (iso.iforest_flag & (ratio > .5)),
-                                   np.fmax(ratio, iso.iforest_score/(-state["iso"].model.offset_)))
+        candidates["combined_m13_baseline"] = (
+            policy_candidates["combined_m13_baseline"],
+            np.fmax(ratio, iso.iforest_score/(-state["iso"].model.offset_)),
+        )
+        candidates["combined_if_full_threshold"] = (
+            policy_candidates["combined_if_full_threshold"], ratio,
+        )
     events = []
     for name in MODELS:
         present = name in candidates and name not in state["unsupported"]
@@ -241,7 +253,7 @@ def run_channel(path, output, channel, annotation_provider, *, labelled_channel=
     a, b = split["train_stop"], split["validation_stop"]
     config = {"channel": channel, "base_row": base_row, "rows": source.rows, "batch_size": batch_size,
               "scope": scope, "split": split, "labelled_channel": labelled_channel}
-    identities = {"source": source.sha256, "code": code_identity(), "config": fingerprint(config), "protocol": fingerprint(PROTOCOL)}
+    identities = {"source": source.sha256, "code": code_identity(), "config": fingerprint(config), "protocol": fingerprint(PROTOCOL), "operator_policy": fingerprint(operator_policy_metadata())}
     with run_lock(output):
         journal = FragmentJournal(output/"journal", identities, fault)
         state = journal.load()
@@ -255,7 +267,7 @@ def run_channel(path, output, channel, annotation_provider, *, labelled_channel=
             initial = training_cadence(index)
             state = {"stage": "statistics", "cursor": 0, "timings": {}, "unsupported": {}, "initial": initial,
                      "coverage": {name: 0 for name in MODELS}, "truncated": 0, "stale": 0}
-            atomic_json(output/"run_configuration.json", {"identities": identities, "configuration": config, "protocol": PROTOCOL})
+            atomic_json(output/"run_configuration.json", {"identities": identities, "configuration": config, "protocol": PROTOCOL, "operator_policy": operator_policy_metadata()})
             journal.commit(state)
 
         def commit(**kwargs):
@@ -291,7 +303,7 @@ def run_channel(path, output, channel, annotation_provider, *, labelled_channel=
                                     state["sampler"].sample(), train_end=split["train_end"]))
                             state["iso"]._training = state["sampler"].metadata()
                         except ValueError as exc:
-                            for name in ("isolation_forest", "combined"):
+                            for name in ("isolation_forest", "combined_m13_baseline", "combined_if_full_threshold"):
                                 state["unsupported"][name] = {"status": "unsupported", "reason": str(exc)}
                     del state["sampler"], state["stat_sampler"]
                     state.update(stage="prefix", cursor=0, tracker=SamplingRegimeTracker(state["initial"]))
@@ -330,7 +342,7 @@ def run_channel(path, output, channel, annotation_provider, *, labelled_channel=
                               "temporal": state["temporal"].metadata(), "statistical": state["stat"].metadata(),
                               "isolation_forest": state["iso"].metadata() if state["iso"] is not None else None,
                               "calibration": {name: state[name+"_cal"].metadata() for name in ("point", "interval")},
-                              "labels_used_for_training_or_calibration": False, "unsupported": state["unsupported"].copy()}
+                              "labels_used_for_training_or_calibration": False, "operator_policy": operator_policy_metadata(), "unsupported": state["unsupported"].copy()}
                     state["frozen"] = frozen
                     state["groupers"] = {name: StreamingTemporalEventGrouper(channel, 1.5 if name in MODELS[:2] else 2.) for name in MODELS}
                     state.update(stage="test", cursor=b)
@@ -473,7 +485,7 @@ def prepare_execution_plan(dataset, store, output, m12_protocol):
         "ingestion_manifest_sha256": file_sha256(manifest_path), "integrity_report_sha256": file_sha256(integrity_path),
         "m12_protocol_sha256": file_sha256(protocol_path), "annotation_sha256": {
             name: file_sha256(dataset/name) for name in ("labels.csv", "anomaly_types.csv")},
-        "runner_code_identity": code_identity(), "protocol": PROTOCOL, "worker_count": 1,
+        "runner_code_identity": code_identity(), "protocol": PROTOCOL, "operator_policy": operator_policy_metadata(), "worker_count": 1,
         "scoring_batch_rows": 5000, "channels": entries,
         "interpretation": "Retrospective B evaluation under a frozen procedure; not external blind validation"}
     plan_id = fingerprint(payload)

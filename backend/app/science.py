@@ -9,6 +9,7 @@ from sklearn.ensemble import IsolationForest
 from sklearn.preprocessing import RobustScaler
 
 from app.dataset import channel_parquet, channel_annotations, metadata
+from app.operator_policy import build_combined_policy_candidates, operator_policy_metadata
 
 @dataclass(frozen=True)
 class Protocol:
@@ -216,7 +217,7 @@ def run_channel(channel:str,output:Path,batch_rows=5000,protocol:Protocol=PROTOC
     train=int(n*protocol.train_fraction); valid=int(n*(protocol.train_fraction+protocol.validation_fraction))
     if min(train,valid-train,n-valid)<30: raise ValueError(f"{channel}: insufficient observations")
     output.mkdir(parents=True,exist_ok=True); scratch=output/"scratch";scratch.mkdir(exist_ok=True)
-    cfg={"channel":channel,"protocol":asdict(protocol),"source_sha256":sha256(path),"rows":n,"split":{"train":train,"validation":valid-train,"test":n-valid}}
+    cfg={"channel":channel,"protocol":asdict(protocol),"operator_policy":operator_policy_metadata(),"source_sha256":sha256(path),"rows":n,"split":{"train":train,"validation":valid-train,"test":n-valid}}
     (output/"configuration.json").write_text(json.dumps(cfg,indent=2),encoding="utf-8")
     started=time.perf_counter(); cadence0=initial_cadence(stream,train); stats=fit_exact_stats(stream,train,scratch)
     # deterministic bounded training sample for IF
@@ -241,7 +242,7 @@ def run_channel(channel:str,output:Path,batch_rows=5000,protocol:Protocol=PROTOC
         if s.index[-1]>=train_boundary:
             mask=s.index>=train_boundary;point_store.add(p[mask]);interval_store.add(i[mask])
     point_t=max(protocol.min_threshold,point_store.quantile_higher(protocol.quantile)); interval_t=max(protocol.min_threshold,interval_store.quantile_higher(protocol.quantile));point_store.close();interval_store.close()
-    frozen={"point_threshold":point_t,"interval_threshold":interval_t,"training":stats,"initial_cadence_seconds":cadence0,"frozen_at":utc_now()}
+    frozen={"point_threshold":point_t,"interval_threshold":interval_t,"training":stats,"initial_cadence_seconds":cadence0,"operator_policy":operator_policy_metadata(),"frozen_at":utc_now()}
     (output/"fitted.json").write_text(json.dumps(frozen,indent=2),encoding="utf-8")
     # Prepare test-only truth before scoring. Labels never enter fitting/calibration.
     ann=channel_annotations(channel).copy()
@@ -268,6 +269,7 @@ def run_channel(channel:str,output:Path,batch_rows=5000,protocol:Protocol=PROTOC
     groupers={k:EventAccumulator(channel,k,protocol.event_bridge_cadences) for k in ("temporal_point","temporal_interval","combined","isolation_forest","timestamp_gap")}
     events=[]; test_rows=0; flagged=0
     sample_tp=sample_fp=sample_fn=sample_tn=0
+    baseline_flagged=full_threshold_flagged=0
     exposure_seconds=0.0; exposure_prev=None
     for s in stream.batches(valid,n):
         cds,gaps=cadence.update(s.index);p,i,prev=temporal_scores(s,stats,prev)
@@ -279,8 +281,14 @@ def run_channel(channel:str,output:Path,batch_rows=5000,protocol:Protocol=PROTOC
             if persistent>=protocol.persistence:active=True
             interval[idx]=active
         feats=np.c_[s.to_numpy(float),p,i]; iso_score=-iso.decision_function(scaler.transform(feats)); iso_flag=iso.predict(scaler.transform(feats))==-1
-        combined=point|interval|(iso_flag & ((p>point_t*.5)|(i>interval_t*.5)))
-        for name,flags,scores in (("temporal_point",point,p),("temporal_interval",interval,i),("isolation_forest",iso_flag,iso_score),("combined",combined,np.maximum(np.maximum(p/max(point_t,1e-9),i/max(interval_t,1e-9)),np.maximum(iso_score,0)))):
+        temporal_flag=point|interval
+        temporal_ratio=np.maximum(p/max(point_t,1e-9),i/max(interval_t,1e-9))
+        temporal_event_score=np.fmax(p/max(point_t,1e-9),i/max(interval_t,1e-9))
+        policy_candidates=build_combined_policy_candidates(temporal_flag,iso_flag,temporal_ratio)
+        combined=policy_candidates["combined"]
+        baseline_flagged+=int(policy_candidates["combined_m13_baseline"].sum())
+        full_threshold_flagged+=int(policy_candidates["combined_if_full_threshold"].sum())
+        for name,flags,scores in (("temporal_point",point,p),("temporal_interval",interval,i),("isolation_forest",iso_flag,iso_score),("combined",combined,temporal_event_score)):
             events.extend(groupers[name].update(s.index,flags,scores,cds)); flagged+=int(flags.sum()) if name=="combined" else 0
         # Sample metrics are assumption-dependent and only defined on labelled Target=YES channels.
         positive=np.zeros(len(s),dtype=bool)
@@ -327,7 +335,7 @@ def run_channel(channel:str,output:Path,batch_rows=5000,protocol:Protocol=PROTOC
     sample_precision=sample_tp/(sample_tp+sample_fp) if labelled_channel and sample_tp+sample_fp else (0.0 if labelled_channel else None)
     sample_recall=sample_tp/(sample_tp+sample_fn) if labelled_channel and sample_tp+sample_fn else None
     sample_f1=2*sample_precision*sample_recall/(sample_precision+sample_recall) if sample_precision is not None and sample_recall is not None and sample_precision+sample_recall else (0.0 if sample_recall is not None else None)
-    report={"channel":channel,"status":"completed","rows":n,"split":{"train_rows":train,"validation_rows":valid-train,"test_rows":n-valid,"test_start":test_start.isoformat(),"test_end":test_end.isoformat()},"test_rows":test_rows,"events":len(events),"combined_events":len(combined),"combined_flagged_samples":flagged,"sample_metrics_nominal_complement":{"available":labelled_channel,"tp":sample_tp if labelled_channel else None,"fp":sample_fp if labelled_channel else None,"fn":sample_fn if labelled_channel else None,"tn":sample_tn if labelled_channel else None,"precision":sample_precision,"recall":sample_recall,"f1":sample_f1,"confirmed_negative_samples":0,"interpretation":"Assumption-dependent on labelled channels; unannotated does not mean independently confirmed physical normal."},"event_metrics_nominal_complement":{"precision":precision if labelled_channel else None,"recall":recall,"f1":f1 if labelled_channel else None,"matched":matched_pred,"truth":len(truth),"false_events_per_observation_day":((len(combined)-matched_pred)*86400/exposure_seconds) if labelled_channel and exposure_seconds else None,"note":"VYOM closed-overlap one-to-one metric; not ESA official alarming/affiliation metric"},"communication_gap":{"predicted":len(gap_predictions),"truth":len(gap_truth),"matched":gap_tp,"recall":gap_tp/len(gap_truth) if len(gap_truth) else None},"resources":{"wall_seconds":time.perf_counter()-started,"observed_test_exposure_seconds":exposure_seconds},"fitted":frozen,"scientific_limits":["Unannotated periods follow the benchmark nominal-complement convention, not independently confirmed physical normality.","Target=NO is never used as a supervised normal class.","Retrospective benchmark results are not external blind validation."]}
+    report={"channel":channel,"status":"completed","rows":n,"split":{"train_rows":train,"validation_rows":valid-train,"test_rows":n-valid,"test_start":test_start.isoformat(),"test_end":test_end.isoformat()},"test_rows":test_rows,"events":len(events),"combined_events":len(combined),"combined_flagged_samples":flagged,"operator_policy":operator_policy_metadata(),"policy_diagnostics":{"active_temporal_first_flagged_samples":flagged,"m13_baseline_half_threshold_flagged_samples":baseline_flagged,"full_threshold_challenger_flagged_samples":full_threshold_flagged,"interpretation":"Alternative policy counts are diagnostics only; active operator incidents use temporal flags only."},"sample_metrics_nominal_complement":{"available":labelled_channel,"tp":sample_tp if labelled_channel else None,"fp":sample_fp if labelled_channel else None,"fn":sample_fn if labelled_channel else None,"tn":sample_tn if labelled_channel else None,"precision":sample_precision,"recall":sample_recall,"f1":sample_f1,"confirmed_negative_samples":0,"interpretation":"Assumption-dependent on labelled channels; unannotated does not mean independently confirmed physical normal."},"event_metrics_nominal_complement":{"precision":precision if labelled_channel else None,"recall":recall,"f1":f1 if labelled_channel else None,"matched":matched_pred,"truth":len(truth),"false_events_per_observation_day":((len(combined)-matched_pred)*86400/exposure_seconds) if labelled_channel and exposure_seconds else None,"note":"VYOM closed-overlap one-to-one metric; not ESA official alarming/affiliation metric"},"communication_gap":{"predicted":len(gap_predictions),"truth":len(gap_truth),"matched":gap_tp,"recall":gap_tp/len(gap_truth) if len(gap_truth) else None},"resources":{"wall_seconds":time.perf_counter()-started,"observed_test_exposure_seconds":exposure_seconds},"fitted":frozen,"scientific_limits":["Unannotated periods follow the benchmark nominal-complement convention, not independently confirmed physical normality.","Target=NO is never used as a supervised normal class.","Retrospective benchmark results are not external blind validation."]}
     with (output/"events.jsonl").open('w',encoding='utf-8') as f:
         for e in events:f.write(json.dumps(e,default=str)+"\n")
     (output/"report.json").write_text(json.dumps(report,indent=2,default=str),encoding='utf-8')

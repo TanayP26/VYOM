@@ -16,6 +16,7 @@ VYOM is an explainable telemetry intelligence product built around **ESA Anomaly
 - Causal cadence tracking and timestamp-gap candidates.
 - Event grouping that stays open across processing batches.
 - Per-channel reports and persisted event evidence.
+- M1.3.1 temporal-first operator policy; IF remains a separate comparator, with the M1.3.0 baseline preserved.
 - Internal VYOM Knowledge assistant through Nebius (optional).
 - Tavily Live Research mode kept separate from mission evidence (optional).
 - Premium desktop-first React operations UI.
@@ -106,4 +107,4 @@ The product writes reports under `ARTIFACT_DIR/run_XXXXX/` and event records int
 
 The product reports VYOM's one-to-one closed-overlap event metric. It does **not** claim equivalence to ESA's official corrected alarming precision or affiliation metric. Unannotated periods follow the benchmark nominal-complement convention where assumption-dependent precision/F1 are shown; that does not prove physical normality. `Target=NO` channels remain contextual/unlabelled and are never manufactured into supervised negative labels.
 
-Read `docs/SCIENTIFIC_PROTOCOL.md` before presenting benchmark results.
+Read `docs/SCIENTIFIC_PROTOCOL.md` and `docs/MILESTONE1_3_1_OPERATOR_POLICY.md` before presenting benchmark results.
