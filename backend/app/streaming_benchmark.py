@@ -168,7 +168,10 @@ def _scores(state, raw, timing):
         "temporal_point": (flags.point_flag, temporal.point_score),
         "temporal_interval": (flags.interval_flag, temporal.interval_score),
         "improved_temporal": (flags.temporal_flag, ratio),
-        "combined": (policy_candidates["combined"], ratio),
+        "combined": (policy_candidates["combined"], np.fmax(
+            temporal.point_score/state["point_cal"].threshold,
+            temporal.interval_score/state["interval_cal"].threshold,
+        )),
     }
     if stat is not None:
         candidates["robust_statistical"] = (stat.statistical_flag, stat.statistical_score)
