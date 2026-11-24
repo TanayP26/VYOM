@@ -14,6 +14,7 @@ import pyarrow.parquet as pq
 from app.artifacts import ResourceMonitor, file_sha256, fingerprint, run_lock, utc_now
 from app.cadence import SamplingRegimeTracker, training_cadence
 from app.calibration import DetectionPolicy
+from app.operator_policy import operator_policy_metadata, temporal_first_operator_flags
 from app.detectors import BoundedTrainingSampler, IsolationForestDetector, StatisticalDetector, _valid
 from app.features import FeatureConfig, TemporalFeatureBuilder
 from app.storage import atomic_json
@@ -47,6 +48,7 @@ PROTOCOL = {
     "statistical_threshold": 6., "tail_probability": .01, "minimum_temporal_threshold": 3.,
     "persistence": 3, "release_ratio": .5, "baseline_bridge": 1.5, "temporal_bridge": 2.,
     "features": asdict(FeatureConfig()), "temporal": asdict(TemporalConfig()),
+    "operator_policy": operator_policy_metadata(),
     "labels_used_for_fit": False, "Target_NO": "unknown; never supervised negatives",
     "A_B": "separate retrospective namespaces; neither is external blind validation",
     "history_compatibility": HISTORY_COMPATIBILITY,
@@ -257,7 +259,7 @@ def _legacy(state, raw):
         if "max_history_rows" not in str(exc):
             raise
         state["legacy_failed"] = True
-        for name in ("robust_statistical", "isolation_forest", "combined"):
+        for name in ("robust_statistical", "isolation_forest"):
             state["unsupported"][name] = {"status": "unsupported", "reason": str(exc),
                 "at": raw.index[0].isoformat(), "no_silent_history_cap_change": True}
         return None
@@ -287,10 +289,18 @@ def _scores(state, raw, timing):
     }
     if stat is not None:
         candidates["robust_statistical"] = (stat.statistical_flag, stat.statistical_score)
+
+    # M1.3.1 operator policy: only calibrated temporal evidence can create an
+    # operator-facing combined incident. Isolation Forest remains a comparator.
+    combined_flags = temporal_first_operator_flags(flags.temporal_flag)
+    combined_scores = np.fmax(
+        temporal.point_score/state["point_cal"].threshold,
+        temporal.interval_score/state["interval_cal"].threshold,
+    )
+    candidates["combined"] = (combined_flags, combined_scores)
+
     if iso is not None:
         candidates["isolation_forest"] = (iso.iforest_flag, iso.iforest_score)
-        candidates["combined"] = (flags.temporal_flag | (iso.iforest_flag & (ratio > .5)),
-                                   np.fmax(ratio, iso.iforest_score/(-state["iso"].model.offset_)))
     events = []
     for name in MODELS:
         present = name in candidates and name not in state["unsupported"]
@@ -378,7 +388,7 @@ def run_channel(path, output, channel, annotation_provider, *, labelled_channel=
             unsupported = {}
             legacy_failed = history_compatibility["status"] != "approved"
             if legacy_failed:
-                for name in ("robust_statistical", "isolation_forest", "combined"):
+                for name in ("robust_statistical", "isolation_forest"):
                     unsupported[name] = {"status": "unsupported",
                         "reason": "Exact frozen feature history exceeds declared compatibility resource ceiling",
                         "history_compatibility": history_compatibility, "no_silent_history_cap_change": True}
@@ -423,7 +433,7 @@ def run_channel(path, output, channel, annotation_provider, *, labelled_channel=
                                     state["sampler"].sample(), train_end=split["train_end"]))
                             state["iso"]._training = state["sampler"].metadata()
                         except ValueError as exc:
-                            for name in ("isolation_forest", "combined"):
+                            for name in ("isolation_forest",):
                                 state["unsupported"][name] = {"status": "unsupported", "reason": str(exc)}
                     del state["sampler"], state["stat_sampler"]
                     state.update(stage="prefix", cursor=0, tracker=SamplingRegimeTracker(state["initial"]))
@@ -463,7 +473,7 @@ def run_channel(path, output, channel, annotation_provider, *, labelled_channel=
                               "isolation_forest": state["iso"].metadata() if state["iso"] is not None else None,
                               "calibration": {name: state[name+"_cal"].metadata() for name in ("point", "interval")},
                               "legacy_features": state["builder"].metadata(), "history_compatibility": state["history_compatibility"],
-                              "labels_used_for_training_or_calibration": False, "unsupported": state["unsupported"].copy()}
+                              "labels_used_for_training_or_calibration": False, "operator_policy": operator_policy_metadata(), "unsupported": state["unsupported"].copy()}
                     state["frozen"] = frozen
                     state["groupers"] = {name: StreamingTemporalEventGrouper(channel, 1.5 if name in MODELS[:2] else 2.) for name in MODELS}
                     state.update(stage="test", cursor=b)

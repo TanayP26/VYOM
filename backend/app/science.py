@@ -9,6 +9,7 @@ from sklearn.ensemble import IsolationForest
 from sklearn.preprocessing import RobustScaler
 
 from app.dataset import channel_parquet, channel_annotations, metadata
+from app.operator_policy import operator_policy_metadata, temporal_first_operator_flags
 from app.cadence import CadenceConfig, SamplingRegimeTracker
 
 @dataclass(frozen=True)
@@ -253,7 +254,7 @@ def run_channel(channel:str,output:Path,batch_rows=5000,protocol:Protocol=PROTOC
     train=int(n*protocol.train_fraction); valid=int(n*(protocol.train_fraction+protocol.validation_fraction))
     if min(train,valid-train,n-valid)<30: raise ValueError(f"{channel}: insufficient observations")
     output.mkdir(parents=True,exist_ok=True); scratch=output/"scratch";scratch.mkdir(exist_ok=True)
-    cfg={"channel":channel,"protocol":asdict(protocol),"source_sha256":sha256(path),"rows":n,"split":{"train":train,"validation":valid-train,"test":n-valid}}
+    cfg={"channel":channel,"protocol":asdict(protocol),"operator_policy":operator_policy_metadata(),"source_sha256":sha256(path),"rows":n,"split":{"train":train,"validation":valid-train,"test":n-valid}}
     (output/"configuration.json").write_text(json.dumps(cfg,indent=2),encoding="utf-8")
     started=time.perf_counter(); cadence0=initial_cadence(stream,train); stats=fit_exact_stats(stream,train,scratch)
     # deterministic bounded training sample for IF
@@ -278,7 +279,7 @@ def run_channel(channel:str,output:Path,batch_rows=5000,protocol:Protocol=PROTOC
         if s.index[-1]>=train_boundary:
             mask=s.index>=train_boundary;point_store.add(p[mask]);interval_store.add(i[mask])
     point_t=max(protocol.min_threshold,point_store.quantile_higher(protocol.quantile)); interval_t=max(protocol.min_threshold,interval_store.quantile_higher(protocol.quantile));point_store.close();interval_store.close()
-    frozen={"point_threshold":point_t,"interval_threshold":interval_t,"training":stats,"initial_cadence_seconds":cadence0,"frozen_at":utc_now()}
+    frozen={"point_threshold":point_t,"interval_threshold":interval_t,"training":stats,"initial_cadence_seconds":cadence0,"operator_policy":operator_policy_metadata(),"frozen_at":utc_now()}
     (output/"fitted.json").write_text(json.dumps(frozen,indent=2),encoding="utf-8")
     # Prepare test-only truth before scoring. Labels never enter fitting/calibration.
     ann=channel_annotations(channel).copy()
@@ -341,8 +342,8 @@ def run_channel(channel:str,output:Path,batch_rows=5000,protocol:Protocol=PROTOC
             if persistent>=protocol.persistence:active=True
             interval[idx]=active
         feats=np.c_[s.to_numpy(float),p,i]; iso_score=-iso.decision_function(scaler.transform(feats)); iso_flag=iso.predict(scaler.transform(feats))==-1
-        combined=point|interval|(iso_flag & ((p>point_t*.5)|(i>interval_t*.5)))
-        for name,flags,scores in (("temporal_point",point,p),("temporal_interval",interval,i),("isolation_forest",iso_flag,iso_score),("combined",combined,np.maximum(np.maximum(p/max(point_t,1e-9),i/max(interval_t,1e-9)),np.maximum(iso_score,0)))):
+        combined=temporal_first_operator_flags(point|interval)
+        for name,flags,scores in (("temporal_point",point,p),("temporal_interval",interval,i),("isolation_forest",iso_flag,iso_score),("combined",combined,np.fmax(p/max(point_t,1e-9),i/max(interval_t,1e-9)))):
             events.extend(groupers[name].update(s.index,flags,scores,cds)); flagged+=int(flags.sum()) if name=="combined" else 0
         # Sample metrics are assumption-dependent and only defined on labelled Target=YES channels.
         positive=np.zeros(len(s),dtype=bool)
