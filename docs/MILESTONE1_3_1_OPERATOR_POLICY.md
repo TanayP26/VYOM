@@ -39,10 +39,13 @@ Run #10 artifacts remain the frozen M1.3.0 baseline and must not be overwritten.
 
 ## Validation boundary
 
-The next scientific evaluation should use one predeclared, previously
-unexposed B1 `Target=YES` channel. Freeze M1.3.1 before viewing that channel's
-predictions or labels. Do not launch the 76-channel benchmark until that
-single-channel result, burden, runtime and integrity are reviewed.
+The first B1 evaluation was predeclared on channel_13 and completed as Run #11.
+The combined policy generated 7,747 candidates and detected 0/1 annotated
+held-out events. It did not establish improved detection quality. See
+MILESTONE1_3_1_B1_EVALUATION.md for the result, burden and limitations.
+Preserve that evaluation and the Run #10 baseline; full 76-channel modeling
+is not validated. Any future detector-quality study requires a new frozen
+method and fresh evaluation.
 
 This remains retrospective research decision support, not external blind
 validation or flight-qualified anomaly detection.

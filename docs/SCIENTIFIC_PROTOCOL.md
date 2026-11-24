@@ -2,46 +2,38 @@
 
 ## Split discipline
 
-Each channel is processed chronologically by observation count:
+Each channel is processed chronologically by observation count: 60% training, 20% validation/calibration, and 20% final retrospective evaluation. No random row shuffling. Final-partition labels are not used to fit statistics or thresholds.
 
-- 60% training
-- 20% validation/calibration
-- 20% final retrospective evaluation
+M1.1 development diagnostics exposed five channels (1, 12, 41, 61 and 74). B1 comprises the other channels; B2 comprises later partitions of exposed channels. These are retrospective partitions, not an external blind experiment. The first B1 evaluation selected channel_13 before outcomes were inspected.
 
-Rows are never randomly shuffled. Final-partition labels are not used to fit training statistics or validation thresholds.
+## Training statistics and calibration
 
-## Training statistics
-
-VYOM computes the finite-value median, median absolute deviation and median positive adjacent step using an exact disk-backed SQLite order-statistic store. The local denominator floor is:
+The finite-value median, MAD and median positive adjacent step are computed using exact disk-backed order statistics. The quantization-aware denominator floor is:
 
 `max(0.5 × median positive step, 0.1 × robust sigma, epsilon × level)`
 
-This prevents ordinary quantized telemetry steps from being divided by a machine-scale epsilon.
+Temporal point and interval thresholds use the exact 99th percentile of validation scores with the higher order statistic and a minimum threshold of 3. No labels are used in calibration.
 
 ## Candidate detectors
 
-- Temporal point score: abrupt change relative to training-only change scale.
-- Temporal interval score: deviation relative to training-only robust scale.
-- Isolation Forest: bounded deterministic training sample; unsupervised comparator.
-- Combined: temporal evidence plus IF only when temporally corroborated.
-- Timestamp gaps: cadence-relative missing-time candidates; they do not establish communication failure.
+- Robust statistical: independent baseline.
+- Temporal point: abrupt change relative to training-derived scale.
+- Temporal interval: persistent deviation with hysteresis.
+- Improved temporal: point or persistent interval evidence.
+- Isolation Forest: independent deterministic bounded unsupervised comparator.
+- Combined M1.3.1: temporal point OR persistent temporal interval. IF cannot independently create an operator incident.
+- Timestamp gaps: cadence-relative missing-time candidates, not proof of communication failure.
 
-## Calibration
+M1.3.0 used temporal_flag OR (isolation_forest_flag AND temporal_ratio > 0.5). This historical rule applies to Run #10, not the current operator policy. See MILESTONE1_3_1_OPERATOR_POLICY.md.
 
-Point and interval thresholds use the exact 99th percentile of validation scores with the `higher` order statistic and minimum threshold 3. Labels are not used for threshold selection.
+## Event and metric semantics
 
-## Event semantics
+Candidate samples are grouped causally across batches. Event records retain start/end, peak time, score, detector, channel and annotation overlap where available. Scores are not probabilities; display severity is not validated spacecraft consequence.
 
-Detection samples are grouped causally across processing batches. Event records retain start/end, peak time, peak score, detector, channel, annotation IDs and categories where overlap exists.
-
-## Ground truth caveat
-
-Unannotated observations can be treated as nominal for benchmark-style precision/F1 only as an explicit convention. This is not proof that those observations are physically error-free. `Target=NO` is not a negative class.
-
-## Metric caveat
-
-VYOM's event metric is one-to-one closed-interval overlap. It must not be presented as the official ESA corrected alarming precision or affiliation score.
+The event metric is one-to-one closed-interval overlap, not ESA's official corrected alarming precision or affiliation metric. Unmatched predictions have unknown physical truth. Nominal-complement precision and F1 are assumption-dependent; supported precision/F1 are unavailable without independently confirmed negative observations. Target=NO remains contextual/unlabelled, never a supervised negative class.
 
 ## Validation status
 
-The source repository completed all-channel ingestion/integrity and bounded detector diagnostics before this product consolidation. A full 76-channel benchmark should be rerun locally with this final distribution before quoting final product metrics.
+All 76 channels were ingested and verified. Run #10 (CH-12, M1.3.0) detected 1/1 annotated event with 31,308 combined candidates. Run #11 (CH-13, M1.3.1) detected 0/1 with 7,747 combined candidates. These are different channels; the shared annotation id_180 also prevents a claim of physical-event independence. The latest result does not establish improved detection quality.
+
+Run #11 completed all six comparator streams on 2,851,702 test observations. See MILESTONE1_3_1_B1_EVALUATION.md for the full interpretation. Preserve both runs. Any future quality study requires a new frozen method and fresh evaluation. Full 76-channel modeling and external/flight validation have not been performed.

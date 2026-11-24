@@ -1,16 +1,28 @@
+# Local research demonstration only. Do not publish these ports externally.
 services:
   api:
     build: ./backend
     env_file: ./backend/.env
     ports:
-      - "8000:8000"
+      - "127.0.0.1:8000:8000"
     volumes:
       - ./data:/data:ro
-      - ./artifacts:/artifacts
+      - ./artifacts/milestone12/telemetry:/telemetry:ro
+      - ./docs:/docs:ro
+      - vyom_runtime:/runtime
     environment:
+      DATABASE_URL: sqlite:////runtime/vyom.db
       DATASET_DIR: /data/esa_adb/mission1/ESA-Mission1
-      TELEMETRY_STORE_DIR: /artifacts/milestone12/telemetry
-      ARTIFACT_DIR: /artifacts/final
+      TELEMETRY_STORE_DIR: /telemetry
+      ARTIFACT_DIR: /runtime/reports
+      EXPERIMENT_DIR: /runtime/experiments
+      CORS_ORIGINS: http://localhost:5173,http://127.0.0.1:5173
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
     restart: unless-stopped
   web:
     build:
@@ -18,7 +30,11 @@ services:
       args:
         VITE_API_URL: http://localhost:8000/api
     ports:
-      - "5173:80"
+      - "127.0.0.1:5173:80"
     depends_on:
-      - api
+      api:
+        condition: service_healthy
     restart: unless-stopped
+
+volumes:
+  vyom_runtime:
