@@ -1,109 +1,91 @@
-# VYOM — Spacecraft Telemetry Intelligence & Anomaly Operations Platform
+# VYOM — Spacecraft Telemetry Intelligence
 
-VYOM is an explainable telemetry intelligence product built around **ESA Anomaly Detection Benchmark — Mission 1**. It combines memory-bounded telemetry access, retrospective anomaly analysis, event evidence, scientific reporting, a grounded knowledge assistant and an operations-oriented React interface.
+VYOM is an academic research platform for retrospective spacecraft telemetry analysis, anomaly investigation and evidence-grounded decision support. It uses the ESA Anomaly Detection Benchmark (Mission 1), statistical machine learning, a memory-bounded streaming pipeline and a React/FastAPI workspace.
 
-> **Boundary:** VYOM is research decision support. It is not flight-qualified, does not control a spacecraft and contains no spacecraft-command path.
+**Research release candidate v2.0.0.** Not flight-qualified, not a live spacecraft monitoring service, and no spacecraft-command capability.
 
-## What is in this final distribution
+## What is implemented
 
-- FastAPI backend and SQLite persistence.
-- 76-channel ESA Mission 1 catalog and annotation APIs.
-- Bounded Parquet telemetry sampling for the UI.
-- Chronological **60/20/20** retrospective fitting protocol.
-- Exact disk-backed median/MAD/validation quantile computation using SQLite order statistics.
-- Quantization-aware temporal point and interval scoring.
-- Deterministic bounded Isolation Forest comparator.
-- Causal cadence tracking and timestamp-gap candidates.
-- Event grouping that stays open across processing batches.
-- Per-channel reports and persisted event evidence.
-- Internal VYOM Knowledge assistant through Nebius (optional).
-- Tavily Live Research mode kept separate from mission evidence (optional).
-- Premium desktop-first React operations UI.
-- Docker and native Windows run paths.
+- All 76 Mission 1 channels ingested into Parquet: 744,856,895 observations (approximately 5.47 GiB).
+- Chronological 60/20/20 protocol with exact training statistics and label-free validation calibration.
+- Cadence-aware temporal point and persistent interval scoring, robust statistical and Isolation Forest comparators, timestamp-gap candidates and event grouping across batches.
+- Active M1.3.1 operator policy: temporal point OR persistent temporal interval; Isolation Forest remains an independent comparator.
+- Memory-bounded checkpointed execution, persisted incident evidence and per-channel scientific reports.
+- Eight-view React workspace, telemetry inspection, bounded incident search and pagination, evidence assistant and optional external research.
+- Optional Nebius inference, LangSmith tracing and Tavily research. Provider configuration is not equivalent to verified connectivity.
 
-## Dataset and artifacts are intentionally NOT bundled
+## Evaluation
 
-The ESA source dataset and the 5.47 GiB M1.2 Parquet store are large and remain local. Point this package at your existing directories:
+| Evidence | Run #10 | Run #11 |
+|---|---|---|
+| Channel | CH-12 | CH-13 |
+| Policy | M1.3.0 | M1.3.1 |
+| Test observations | 2,851,702 | 2,851,702 |
+| Combined predicted events | 31,308 | 7,747 |
+| Annotated event recall | 1/1 | 0/1 |
+| Labelled sample recall | 2/1,727 | 0/1,706 |
+| Peak sampled RSS | 435.836 MiB | 439.137 MiB |
 
-```text
-D:\Projects\VYOM\VYOM\data\esa_adb\mission1\ESA-Mission1
-D:\Projects\VYOM\VYOM\artifacts\milestone12\telemetry
-```
+These are separate retrospective channel evaluations, not a controlled before/after comparison. The annotation id_180 occurs in both channels, so physical-event independence is not established. Unmatched candidates have unknown physical truth; supported precision and F1 are unavailable without independently confirmed negatives. Full-mission ingestion does not establish full-mission detection performance.
 
-If you replace your current repository with this package, copy or keep the existing `data/` and `artifacts/` directories beside it.
+The verified release candidate passed 293 backend regression tests, dependency checks and the TypeScript/Vite production build on Windows. The scientific engine remains frozen at efce54a; the UI/product release candidate is a9ebeed. These tests verify implementation, not operational detection quality.
 
-## Windows setup
+Read [scientific protocol](docs/SCIENTIFIC_PROTOCOL.md), [operator policy](docs/MILESTONE1_3_1_OPERATOR_POLICY.md) and [B1 evaluation](docs/MILESTONE1_3_1_B1_EVALUATION.md).
+
+## Local setup
+
+The ESA dataset, Parquet store, run artifacts and SQLite database are intentionally not committed. Obtain the original ESA data separately and retain the existing M1.2 ingestion output. Without local data, the UI cannot reproduce the mission evidence or historical runs.
+
+From the repository root, in PowerShell:
 
 ```powershell
-cd D:\Projects\VYOM\VYOM\backend
+cd backend
 python -m venv .venv
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+Set-ExecutionPolicy -Scope Process Bypass
 .\.venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
-Copy-Item .env.example .env
+if (-not (Test-Path .env)) { Copy-Item .env.example .env }
+cd ..\frontend
+npm ci
+cd ..
+.\scripts\verify_windows.ps1
+.\scripts\run_windows.ps1
 ```
 
-Edit `.env` so these point at your existing data:
+Use the existing environment if already configured. Set the dataset/store paths in backend/.env:
 
-```env
+```dotenv
 DATASET_DIR=../data/esa_adb/mission1/ESA-Mission1
 TELEMETRY_STORE_DIR=../artifacts/milestone12/telemetry
 ARTIFACT_DIR=../artifacts/final
 ```
 
-Then:
+UI: http://localhost:5173 · API documentation: http://localhost:8000/docs.
 
-```powershell
-python -m pytest -q
-python -m uvicorn app.main:app --reload
-```
+## Optional intelligence providers
 
-Second terminal:
+In backend/.env, configure the following only if you have the corresponding credentials. Never commit credentials.
 
-```powershell
-cd D:\Projects\VYOM\VYOM\frontend
-npm install
-npm run dev
-```
-
-Open:
-
-- UI: `http://localhost:5173`
-- API: `http://localhost:8000/docs`
-
-## Intelligence providers
-
-Optional `.env` settings:
-
-```env
+```dotenv
 NEBIUS_BASE_URL=https://api.tokenfactory.nebius.com/v1/
 NEBIUS_API_KEY=
-NEBIUS_MODEL=
+NEBIUS_MODEL=Qwen/Qwen3-235B-A22B-Instruct-2507
 TAVILY_API_KEY=
 LANGSMITH_API_KEY=
 LANGSMITH_PROJECT=VYOM
 ```
 
-VYOM Knowledge uses only internal retrieved evidence. Live Research uses Tavily and is explicitly returned as external evidence.
+Use an exact model ID returned by your provider's model catalog; availability may change. The assistant retrieves internal documents, while Tavily research remains explicitly external. No model training is delegated to the assistant. Restart the backend after modifying configuration.
 
-## Full-mission analysis
+## Deployment and safety
 
-The UI defaults to selected channels. A 76-channel retrospective run requires an explicit confirmation because it is compute-intensive and should not be confused with live/flight analysis.
+See [deployment checklist](docs/RELEASE_DEPLOYMENT.md). Native Windows execution is verified; container execution and public hosting require separate verification. Do not expose the API publicly without authentication, authorization, rate limits, restricted data access and an appropriate persistence and cost-control plan.
 
-API request:
+A full 76-channel analysis requires explicit confirmation and substantial compute. It is not required for a demonstration of the verified release. Preserve Run #10 and Run #11; do not rerun or tune them for a presentation.
 
-```json
-{
-  "full_mission": true,
-  "confirm_full": true,
-  "batch_rows": 5000
-}
-```
+## Reproducibility
 
-The product writes reports under `ARTIFACT_DIR/run_XXXXX/` and event records into the database.
-
-## Scientific interpretation
-
-The product reports VYOM's one-to-one closed-overlap event metric. It does **not** claim equivalence to ESA's official corrected alarming precision or affiliation metric. Unannotated periods follow the benchmark nominal-complement convention where assumption-dependent precision/F1 are shown; that does not prove physical normality. `Target=NO` channels remain contextual/unlabelled and are never manufactured into supervised negative labels.
-
-Read `docs/SCIENTIFIC_PROTOCOL.md` before presenting benchmark results.
+- Scientific freeze: tag m131-run11-evaluated.
+- Predeclared B1 selection: tag m131-b1-channel13-predeclared.
+- Run artifacts and database are local and must be backed up separately from the Git repository.
+- No independently validated production or flight deployment is claimed.
