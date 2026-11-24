@@ -283,11 +283,12 @@ def run_channel(channel:str,output:Path,batch_rows=5000,protocol:Protocol=PROTOC
         feats=np.c_[s.to_numpy(float),p,i]; iso_score=-iso.decision_function(scaler.transform(feats)); iso_flag=iso.predict(scaler.transform(feats))==-1
         temporal_flag=point|interval
         temporal_ratio=np.maximum(p/max(point_t,1e-9),i/max(interval_t,1e-9))
+        temporal_event_score=np.fmax(p/max(point_t,1e-9),i/max(interval_t,1e-9))
         policy_candidates=build_combined_policy_candidates(temporal_flag,iso_flag,temporal_ratio)
         combined=policy_candidates["combined"]
         baseline_flagged+=int(policy_candidates["combined_m13_baseline"].sum())
         full_threshold_flagged+=int(policy_candidates["combined_if_full_threshold"].sum())
-        for name,flags,scores in (("temporal_point",point,p),("temporal_interval",interval,i),("isolation_forest",iso_flag,iso_score),("combined",combined,temporal_ratio)):
+        for name,flags,scores in (("temporal_point",point,p),("temporal_interval",interval,i),("isolation_forest",iso_flag,iso_score),("combined",combined,temporal_event_score)):
             events.extend(groupers[name].update(s.index,flags,scores,cds)); flagged+=int(flags.sum()) if name=="combined" else 0
         # Sample metrics are assumption-dependent and only defined on labelled Target=YES channels.
         positive=np.zeros(len(s),dtype=bool)
