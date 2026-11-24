@@ -24,6 +24,22 @@ from app.streaming_state import StreamingTemporalEventGrouper
 from app.streaming_statistics import fit_temporal_stream, calibrate_stream
 
 MODELS = ("robust_statistical", "isolation_forest", "temporal_point", "temporal_interval", "improved_temporal", "combined")
+# M1/M1.1 scale=4 was retained as a diagnostic only. None of the M1.3
+# robust-statistical / Isolation-Forest / combined comparator inputs consume
+# median_scale_4, mad_scale_4 or robust_score_scale_4.
+LEGACY_COMPARATOR_FEATURE_CONFIG = FeatureConfig(scales=(1,))
+HISTORY_COMPATIBILITY_CEILING_ROWS = 50000
+HISTORY_COMPATIBILITY = {
+    "mode": "timestamp_only_exact_capacity_preflight",
+    "default_guard_rows": 10000,
+    "ceiling_rows": HISTORY_COMPATIBILITY_CEILING_ROWS,
+    "feature_math_changed": False,
+    "resampling": False,
+    "adaptive_cadence_fed_to_legacy_features": False,
+    "labels_used": False,
+    "values_used": False,
+    "interpretation": "Engineering compatibility extension for exact frozen fixed-time windows; never silent truncation",
+}
 PROTOCOL = {
     "version": 1, "fitting": "frozen_procedure_new_channel_specific_fitted_identity",
     "train_fraction": .6, "validation_fraction": .2, "seed": 42,
@@ -33,6 +49,7 @@ PROTOCOL = {
     "features": asdict(FeatureConfig()), "temporal": asdict(TemporalConfig()),
     "labels_used_for_fit": False, "Target_NO": "unknown; never supervised negatives",
     "A_B": "separate retrospective namespaces; neither is external blind validation",
+    "history_compatibility": HISTORY_COMPATIBILITY,
 }
 
 
@@ -58,6 +75,8 @@ class ParquetChannel:
         self.batch_size = batch_size
         self.read_seconds = 0.
         self.rows_read = 0
+        self.timestamp_read_seconds = 0.
+        self.timestamp_rows_read = 0
 
     def batches(self, start=0, stop=None):
         stop = self.rows if stop is None else stop
@@ -95,6 +114,34 @@ class ParquetChannel:
                     if offset >= upper:
                         return
 
+    def timestamp_batches(self, start=0, stop=None):
+        """Read only timestamps for deterministic resource/capacity planning."""
+        stop = self.rows if stop is None else stop
+        if not 0 <= start <= stop <= self.rows:
+            raise ValueError("Read range outside planned channel")
+        lower, upper = self.base_row + start, self.base_row + stop
+        with pq.ParquetFile(self.path) as parquet:
+            offset = 0
+            for group in range(parquet.num_row_groups):
+                length = parquet.metadata.row_group(group).num_rows
+                if offset + length <= lower:
+                    offset += length; continue
+                if offset >= upper: break
+                iterator = iter(parquet.iter_batches(row_groups=[group], columns=["timestamp"], batch_size=self.batch_size))
+                while True:
+                    begin = time.perf_counter()
+                    try: batch = next(iterator)
+                    except StopIteration: break
+                    index = pd.DatetimeIndex(batch.column(0).to_pandas())
+                    index = index.tz_localize("UTC") if index.tz is None else index.tz_convert("UTC")
+                    index = index.as_unit("ns")
+                    left, right = max(0, lower-offset), min(len(index), upper-offset)
+                    self.timestamp_rows_read += len(index)
+                    offset += len(index)
+                    self.timestamp_read_seconds += time.perf_counter()-begin
+                    if left < right: yield index[left:right]
+                    if offset >= upper: return
+
     def timestamp(self, ordinal):
         return next(self.batches(ordinal, ordinal+1)).index[0]
 
@@ -129,9 +176,81 @@ def locate_timestamp(path, timestamp, batch_size=5000):
         raise ValueError("Requested window starts after source end")
 
 
+
+def history_capacity_preflight(source, cadence_seconds, config=None, ceiling_rows=HISTORY_COMPATIBILITY_CEILING_ROWS):
+    """Compute exact row capacity for the frozen fixed-time feature window using timestamps only."""
+    config = config or FeatureConfig()
+    duration_seconds = cadence_seconds * config.window_samples * max(config.scales)
+    duration_ns = int(round(duration_seconds * 1e9))
+    history = np.empty(0, dtype=np.int64)
+    max_window_rows = max_retained_rows = scanned_rows = 0
+    for index in source.timestamp_batches():
+        times = index.as_unit("ns").asi8
+        if not len(times): continue
+        if len(history) and times[0] <= history[-1]:
+            raise ValueError("History preflight requires strictly increasing timestamps")
+        combined = np.concatenate([history, times])
+        offset = len(history)
+        starts = np.searchsorted(combined, times-duration_ns, side="left")
+        ends = np.arange(offset, offset+len(times), dtype=np.int64)
+        widths = ends-starts
+        if len(widths): max_window_rows = max(max_window_rows, int(widths.max()))
+        keep_at = int(np.searchsorted(combined, times[-1]-duration_ns, side="left"))
+        history = combined[keep_at:].copy()
+        max_retained_rows = max(max_retained_rows, len(history))
+        scanned_rows += len(times)
+    exact_required = max(max_window_rows, max_retained_rows)
+    required = max(config.max_history_rows, exact_required)
+    approved = required <= ceiling_rows
+    return {
+        "status": "approved" if approved else "unsupported_resource_ceiling",
+        "mode": HISTORY_COMPATIBILITY["mode"],
+        "initial_cadence_seconds": float(cadence_seconds),
+        "longest_fixed_window_seconds": float(duration_seconds),
+        "frozen_default_guard_rows": int(config.max_history_rows),
+        "exact_required_rows": int(exact_required),
+        "approved_cap_rows": int(required) if approved else int(config.max_history_rows),
+        "ceiling_rows": int(ceiling_rows),
+        "timestamp_rows_scanned": int(scanned_rows),
+        "feature_math_changed": False, "resampling": False, "labels_used": False, "values_used": False,
+        "decision": ("Exact fixed-time legacy feature window enabled with an audited engineering history budget" if approved else
+                     "Legacy comparators must abstain because exact fixed-time history exceeds the declared resource ceiling"),
+    }
+
+
+def _legacy_feature_config(history_compatibility):
+    base = LEGACY_COMPARATOR_FEATURE_CONFIG
+    return FeatureConfig(
+        window_samples=base.window_samples,
+        scales=tuple(base.scales),
+        min_periods=base.min_periods,
+        epsilon=base.epsilon,
+        score_cap=base.score_cap,
+        max_history_rows=int(history_compatibility["approved_cap_rows"]),
+        block_size=base.block_size,
+    )
+
+def _assert_legacy_builder_contract(builder, history_compatibility):
+    expected = _legacy_feature_config(history_compatibility)
+    actual = builder.config
+    fields = ("window_samples", "scales", "min_periods", "epsilon",
+              "score_cap", "max_history_rows", "block_size")
+    mismatches = {
+        name: {"expected": getattr(expected, name), "actual": getattr(actual, name)}
+        for name in fields
+        if getattr(expected, name) != getattr(actual, name)
+    }
+    if mismatches:
+        raise RuntimeError(
+            "M1.3 legacy feature-builder contract drift: "
+            + json.dumps(mismatches, default=str, sort_keys=True)
+        )
+    return actual
+
 def _legacy(state, raw):
     if state.get("legacy_failed"):
         return None
+    _assert_legacy_builder_contract(state["builder"], state["history_compatibility"])
     try:
         return state["builder"].transform(raw)
     except ValueError as exc:
@@ -239,8 +358,13 @@ def run_channel(path, output, channel, annotation_provider, *, labelled_channel=
     source = ParquetChannel(path, base_row, rows, batch_size, expected_sha256)
     split = source.split(train_fraction, validation_fraction)
     a, b = split["train_stop"], split["validation_stop"]
+    initial_index = pd.DatetimeIndex(np.concatenate([s.index.as_unit("ns").asi8 for s in source.batches(0, min(a, 10001))]), tz="UTC")
+    initial = training_cadence(initial_index)
+    history_compatibility = history_capacity_preflight(source, initial, config=LEGACY_COMPARATOR_FEATURE_CONFIG)
     config = {"channel": channel, "base_row": base_row, "rows": source.rows, "batch_size": batch_size,
-              "scope": scope, "split": split, "labelled_channel": labelled_channel}
+              "scope": scope, "split": split, "labelled_channel": labelled_channel,
+              "history_compatibility": history_compatibility,
+              "legacy_comparator_feature_config": asdict(LEGACY_COMPARATOR_FEATURE_CONFIG)}
     identities = {"source": source.sha256, "code": code_identity(), "config": fingerprint(config), "protocol": fingerprint(PROTOCOL)}
     with run_lock(output):
         journal = FragmentJournal(output/"journal", identities, fault)
@@ -251,10 +375,17 @@ def run_channel(path, output, channel, annotation_provider, *, labelled_channel=
                 raise ValueError("Completed report corrupted")
             return report
         if state is None:
-            index = pd.DatetimeIndex(np.concatenate([s.index.as_unit("ns").asi8 for s in source.batches(0, min(a, 10001))]), tz="UTC")
-            initial = training_cadence(index)
-            state = {"stage": "statistics", "cursor": 0, "timings": {}, "unsupported": {}, "initial": initial,
+            unsupported = {}
+            legacy_failed = history_compatibility["status"] != "approved"
+            if legacy_failed:
+                for name in ("robust_statistical", "isolation_forest", "combined"):
+                    unsupported[name] = {"status": "unsupported",
+                        "reason": "Exact frozen feature history exceeds declared compatibility resource ceiling",
+                        "history_compatibility": history_compatibility, "no_silent_history_cap_change": True}
+            state = {"stage": "statistics", "cursor": 0, "timings": {}, "unsupported": unsupported,
+                     "initial": initial, "history_compatibility": history_compatibility, "legacy_failed": legacy_failed,
                      "coverage": {name: 0 for name in MODELS}, "truncated": 0, "stale": 0}
+            atomic_json(output/"history_compatibility.json", history_compatibility)
             atomic_json(output/"run_configuration.json", {"identities": identities, "configuration": config, "protocol": PROTOCOL})
             journal.commit(state)
 
@@ -266,7 +397,8 @@ def run_channel(path, output, channel, annotation_provider, *, labelled_channel=
                 if state["stage"] == "statistics":
                     state["temporal"] = _timed(state, "statistics", lambda: fit_temporal_stream(
                         lambda: source.batches(0, a), output/"scratch", train_end=split["train_end"]))
-                    state.update(stage="train_features", cursor=0, builder=TemporalFeatureBuilder(state["initial"]),
+                    feature_config = FeatureConfig(max_history_rows=int(state["history_compatibility"]["approved_cap_rows"]))
+                    state.update(stage="train_features", cursor=0, builder=TemporalFeatureBuilder(state["initial"], _legacy_feature_config(state["history_compatibility"])),
                                  sampler=BoundedTrainingSampler(10000, 42, split["train_end"]),
                                  stat_sampler=BoundedTrainingSampler(20000, 42, split["train_end"]))
                     commit()
@@ -330,6 +462,7 @@ def run_channel(path, output, channel, annotation_provider, *, labelled_channel=
                               "temporal": state["temporal"].metadata(), "statistical": state["stat"].metadata(),
                               "isolation_forest": state["iso"].metadata() if state["iso"] is not None else None,
                               "calibration": {name: state[name+"_cal"].metadata() for name in ("point", "interval")},
+                              "legacy_features": state["builder"].metadata(), "history_compatibility": state["history_compatibility"],
                               "labels_used_for_training_or_calibration": False, "unsupported": state["unsupported"].copy()}
                     state["frozen"] = frozen
                     state["groupers"] = {name: StreamingTemporalEventGrouper(channel, 1.5 if name in MODELS[:2] else 2.) for name in MODELS}
@@ -407,6 +540,7 @@ def run_channel(path, output, channel, annotation_provider, *, labelled_channel=
                               "identities": identities, "frozen": state["frozen"], "models": {name: ev.result() for name, ev in evaluators.items() if name!="adaptive_gap"},
                               "communication_gaps": evaluators["adaptive_gap"].result(), "unsupported_comparators": state["unsupported"],
                               "comparator_scored_rows": state["coverage"], "history_truncation_rows": state["truncated"], "post_gap_test_rows": state["stale"],
+                              "history_compatibility": state["history_compatibility"],
                               "stage_seconds": state["timings"], "regimes": state["tracker"].regimes(),
                               "events_storage": "journal immutable events and correlated_events fragments",
                               "random_forest": {"status": "unsupported", "reason": "No independently confirmed negative training labels"},
@@ -422,6 +556,8 @@ def run_channel(path, output, channel, annotation_provider, *, labelled_channel=
                 raise
         execution = {"completed_at": utc_now(), "resources": monitor.measurements, "read_seconds": source.read_seconds,
                      "decoded_rows": source.rows_read, "read_rows_per_second": source.rows_read/source.read_seconds if source.read_seconds else None,
+                     "history_preflight_timestamp_rows": source.timestamp_rows_read,
+                     "history_preflight_timestamp_read_seconds": source.timestamp_read_seconds,
                      "storage": journal.storage_metrics(), "checkpoint_seconds_this_attempt": journal.commit_seconds,
                      "statistics_resources": state["temporal"].streaming_resources,
                      "calibration_resources": {name: state[name+"_cal"].streaming_resources for name in ("point", "interval")}}

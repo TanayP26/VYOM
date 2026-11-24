@@ -35,6 +35,30 @@ def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def atomic_replace(source, destination, *, attempts=40, initial_delay=.01, max_delay=.25):
+    # Atomically publish a complete artifact, tolerating transient Windows locks.
+    source, destination = Path(source), Path(destination)
+    delay = float(initial_delay)
+    last_error = None
+    for attempt in range(int(attempts)):
+        try:
+            os.replace(source, destination)
+            return
+        except PermissionError as exc:
+            last_error = exc
+        except OSError as exc:
+            if os.name != "nt" or getattr(exc, "winerror", None) not in {5, 32, 33}:
+                raise
+            last_error = exc
+        if attempt + 1 >= attempts:
+            break
+        time.sleep(delay)
+        delay = min(max_delay, delay * 1.6)
+    raise PermissionError(
+        f"Atomic publish failed after {attempts} attempts: {source} -> {destination}"
+    ) from last_error
+
+
 def atomic_json(path: Path, payload: dict) -> None:
     """Replace a JSON artifact only after its complete contents reach disk."""
     path = Path(path)
@@ -46,10 +70,14 @@ def atomic_json(path: Path, payload: dict) -> None:
             stream.write("\n")
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temporary, path)
+        atomic_replace(temporary, path)
     finally:
         if os.path.exists(temporary):
-            os.unlink(temporary)
+            try:
+                os.unlink(temporary)
+            except OSError:
+                # Best-effort cleanup only; never mask the publish result.
+                pass
 
 
 @contextmanager
@@ -304,7 +332,7 @@ def ingest_dataset(root: Path, output: Path, channels=None, force: bool = False,
                     raise RuntimeError(f"{channel}: source changed during ingestion; retry from a stable dataset")
                 with temporary.open("r+b") as stream:
                     os.fsync(stream.fileno())
-                os.replace(temporary, destination)
+                atomic_replace(temporary, destination)
                 manifest["channels"][channel].update(profile, path=str(destination),
                     file_size_bytes=destination.stat().st_size, file_sha256=_file_sha256(destination),
                     status="completed", completed_at=_now(),

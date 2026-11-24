@@ -8,9 +8,30 @@ from sqlalchemy.orm import Session
 from app.core import settings
 from app.db import SessionLocal,AnalysisRun,DetectionEvent
 from app.dataset import channel_catalog,channel_parquet,mission_summary,channel_annotations
-from app.science import run_channel
+from app.product_streaming import run_channel
 
-_run_lock=threading.Lock()
+_run_guard=threading.Lock()
+_active_run_id:int|None=None
+
+def reserve_run(run_id:int)->bool:
+    """Reserve the single in-process analysis slot for a run id."""
+    global _active_run_id
+    with _run_guard:
+        if _active_run_id is None:
+            _active_run_id=run_id
+            return True
+        return _active_run_id==run_id
+
+def active_run_id()->int|None:
+    with _run_guard:
+        return _active_run_id
+
+def release_run(run_id:int)->None:
+    """Release only the reservation owned by this run."""
+    global _active_run_id
+    with _run_guard:
+        if _active_run_id==run_id:
+            _active_run_id=None
 
 def event_to_db(run_id,e):
     def dt(x):return pd.Timestamp(x).to_pydatetime()
@@ -20,7 +41,8 @@ def event_to_db(run_id,e):
 def execute_run(run_id:int):
     db=SessionLocal();run=db.get(AnalysisRun,run_id)
     try:
-        if not _run_lock.acquire(blocking=False):raise RuntimeError("Another analysis is already running in this API process")
+        if not reserve_run(run_id):
+            raise RuntimeError(f"Another analysis is already running in this API process (run #{active_run_id()})")
         run.status="running";run.started=datetime.now(timezone.utc);db.commit()
         channels=run.configuration.get("channels",[]);out=settings().resolve(settings().artifact_dir)/f"run_{run_id:05d}";out.mkdir(parents=True,exist_ok=True)
         summaries=[]
@@ -38,7 +60,7 @@ def execute_run(run_id:int):
         if run:
             run.status="failed";run.error=f"{type(exc).__name__}: {exc}\n{traceback.format_exc(limit=4)}"[:5000];run.completed=datetime.now(timezone.utc);db.commit()
     finally:
-        if _run_lock.locked():_run_lock.release()
+        release_run(run_id)
         db.close()
 
 def telemetry_sample(channel:str,start=None,end=None,points=1400):
