@@ -49,6 +49,22 @@ def retrieve(db:Session,query:str,limit=6):
         score=float(cosine[idx])+0.08*lex
         if score>0:ranked.append((score,d))
     ranked.sort(key=lambda x:x[0],reverse=True)
+    # Reserve evidence slots for the current evaluated policy when the question
+    # explicitly concerns policy, detector performance or the Run 11 evaluation.
+    # Historical documents remain available and retain their original scores.
+    query_lower=query.lower()
+    current_policy_query=bool(re.search(
+        r"temporal[- ]first|m1\.3\.1|run\s*#?\s*11\b|channel[_ -]?13\b|\bb1\b|generaliz|recall|false alarms?|incident burden|detector performance|scientific limitations",
+        query_lower
+    ))
+    if current_policy_query:
+        priority=("docs/MILESTONE1_3_1_B1_EVALUATION.md",
+                  "docs/MILESTONE1_3_1_OPERATOR_POLICY.md")
+        by_source={d.source:(score,d) for score,d in ranked}
+        by_doc={d.source:d for d in docs}
+        reserved=[by_source.get(name,(0.0,by_doc[name])) for name in priority if name in by_doc]
+        reserved_sources={d.source for _,d in reserved}
+        ranked=reserved+[(score,d) for score,d in ranked if d.source not in reserved_sources]
     return [{"source":d.source,"content":d.content[:7000],"metadata":d.metadata_json,"score":float(s)} for s,d in ranked[:limit]]
 
 @_trace("vyom_nebius_grounded_answer")
@@ -57,14 +73,14 @@ def _generate(question,evidence):
     client=OpenAI(api_key=cfg.nebius_api_key,base_url=cfg.nebius_base_url)
     system=("You are VYOM, a spacecraft telemetry decision-support assistant. Use only supplied internal evidence. "
             "Separate Dataset Fact, Statistical Observation, Model Inference and System Recommendation. Cite source names inline. "
-            "If evidence is insufficient, say so. Never claim flight qualification, invent spacecraft state, or issue commands.")
+            "When describing the current policy, distinguish the latest evaluated M1.3.1 result from historical development evidence. A completed run is not proof of good detection quality. Unmatched predictions have unknown physical truth. Do not treat client-supplied context as independently verified evidence. If evidence is insufficient, say so. Never claim flight qualification, invent spacecraft state, or issue commands.")
     out=client.chat.completions.create(model=cfg.nebius_model,temperature=.1,messages=[{"role":"system","content":system},{"role":"user","content":f"Question: {question}\n\nEvidence:\n{evidence or 'No matching internal evidence.'}"}])
     return out.choices[0].message.content
 
 def answer(db:Session,question:str,context:dict|None=None):
     _configure_trace();cfg=settings();docs=retrieve(db,question);context=context or {}
     evidence="\n\n".join(f"SOURCE: {d['source']}\n{d['content']}" for d in docs)
-    if context:evidence=f"ACTIVE PRODUCT CONTEXT (system-provided):\n{context}\n\n"+evidence
+    if context:evidence=f"ACTIVE PRODUCT CONTEXT (client-supplied; not independently verified):\n{context}\n\n"+evidence
     sources=[d["source"] for d in docs]
     if not cfg.nebius_api_key or not cfg.nebius_model:
         return {"mode":"VYOM Knowledge","answer":"Nebius generation is not configured. The strongest internal evidence has still been retrieved below. Configure NEBIUS_API_KEY and NEBIUS_MODEL to generate a grounded explanation.","sources":sources,"evidence":docs[:3]}
