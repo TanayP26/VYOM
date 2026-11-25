@@ -2,7 +2,7 @@
 
 ## Verified native baseline
 
-The Windows release candidate passed 293 backend tests, dependency checks and the frontend production build. The existing native installation is the recommended demonstration path because its database contains the historical runs. Container operation is a separate, not yet verified deployment target.
+The Windows release candidate passed 293 backend tests, dependency checks and the frontend production build. The existing native installation is the recommended demonstration path because its database contains the historical runs. Local container startup and HTTP/provider smoke tests were subsequently verified on Windows Docker Desktop. See the observed deployment acceptance record below.
 
 Stop VYOM before backing up its local SQLite database and run artifacts. Preserve the source dataset, Parquet store, Run 10 and Run 11 artifacts, and database independently of Git. Never copy secrets into the repository or presentation.
 
@@ -46,3 +46,17 @@ This configuration is not a public hosting architecture. The current API exposes
 - Nebius returns a grounded answer; LangSmith tracing is checked separately if configured.
 - Container startup and its health/mission APIs are verified before calling the container deployment complete.
 - Report, presentation and README state the observed detection limitations and the absence of full-mission modeling and flight validation.
+
+## Observed deployment acceptance — 25 November 2026 (IST)
+
+The local Docker Compose build and startup succeeded with Docker Engine 29.9.3 and Compose 5.7.0. Both images built; the API was healthy and the web service running on loopback ports 8000 and 5173. The persistent runtime volume was created.
+
+- Frontend HTTP response: 200.
+- Dataset and Parquet store checks: successful; 76 ingested channels, 744,856,895 observations, 3,589 annotations.
+- CH-13 telemetry: 1,400 returned points from a bounded 28,000-row prefix of 14,258,506 source rows (2000-01-01 to 2000-01-30 UTC).
+- Nebius: successful response to a Run 11 scientific question, including six retrieved internal documents and the current evaluation record.
+- Tavily: six external research results, explicitly separated from internal mission evidence.
+- LangSmith: configured, actual trace verification pending.
+- Persistence across container recreation, all-page browser acceptance, and public deployment were not independently demonstrated by these smoke tests.
+
+The assistant response correctly reported the missed annotation, unknown physical truth of unmatched candidates, and unavailable supported precision/F1, but overstated cross-channel comparison and event dependence. Subsequent prompt clarification requires a fresh inference smoke test; it does not change scientific scoring. This record describes the observed packaging smoke tests, not a fresh scientific evaluation.
