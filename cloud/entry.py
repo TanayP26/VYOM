@@ -3,6 +3,8 @@ import base64
 import binascii
 import hmac
 import os
+import json
+import shutil
 from pathlib import Path
 from collections import defaultdict, deque
 from threading import Lock
@@ -38,8 +40,11 @@ def credentials_ok(header, username, password):
 def same_origin(origin, domain):
     if not origin or not domain:
         return False
-    parsed = urlsplit(origin)
-    return parsed.scheme == "https" and parsed.netloc.lower() == domain.lower() and not parsed.path
+    try:
+        parsed = urlsplit(origin)
+        return parsed.scheme == "https" and parsed.netloc.lower() == domain.lower() and not parsed.path and not parsed.query and not parsed.fragment
+    except ValueError:
+        return False
 
 class Gate:
     """Fail closed. Single worker, global endpoint throttles, bounded JSON requests."""
@@ -69,6 +74,8 @@ class Gate:
             return await deny(403, "Remote knowledge ingestion disabled")
         if method not in {"GET", "HEAD", "POST"}:
             return await deny(405, "Method not allowed")
+        if request.headers.get("sec-fetch-site") in {"cross-site", "same-site"} and (method == "POST" or path.rstrip("/") == "/api/research/search"):
+            return await deny(403, "Cross-origin operation blocked")
         if method == "POST":
             if not same_origin(request.headers.get("origin", ""), DOMAIN):
                 return await deny(403, "Same-origin HTTPS request required")
@@ -97,6 +104,22 @@ class Gate:
                     return await deny(413, "Request too large")
                 if not msg.get("more_body", False):
                     break
+            if rate_key == "/api/analysis/runs":
+                try:
+                    payload = json.loads(body)
+                    if not isinstance(payload, dict):
+                        raise ValueError("Expected object")
+                    channels = payload.get("channels") or ["channel_12", "channel_41", "channel_61"]
+                    if not isinstance(channels, list) or any(not isinstance(x, str) for x in channels) or len(channels) > 76 or len(set(channels)) != len(channels):
+                        raise ValueError("Invalid or duplicate channel selection")
+                    batch = payload.get("batch_rows", 5000)
+                    if type(batch) is not int or not 500 <= batch <= 5000:
+                        raise ValueError("Cloud batch size must be between 500 and 5000")
+                    required = (76 if payload.get("full_mission") else len(channels)) * 2 * 1024**3 + 2 * 1024**3
+                except (ValueError, TypeError, UnicodeError) as exc:
+                    return await deny(422, str(exc))
+                if shutil.disk_usage(ROOT).free < required:
+                    return await deny(409, "Insufficient cloud storage headroom for requested analysis; increase persistent volume capacity")
             delivered = False
             original_receive = receive
             async def replay():
@@ -123,6 +146,9 @@ if MODE == "serve":
         raise RuntimeError("Set VYOM_CLOUD_USER and a strong VYOM_CLOUD_PASSWORD")
     if not (ROOT / "migration_verified.json").is_file():
         raise RuntimeError("Verify uploaded evidence before enabling serve mode")
+    marker = json.loads((ROOT / "migration_verified.json").read_text(encoding="utf-8"))
+    if marker.get("status") != "verified" or marker.get("channels") != 76 or marker.get("observations") != 744856895:
+        raise RuntimeError("Cloud migration verification marker is invalid")
     from app.main import app as inner
     inner.mount("/", StaticFiles(directory="/app/static", html=True), name="frontend")
 else:
