@@ -26,7 +26,7 @@ The script copies the original dataset, 76-channel Parquet store and archived fi
 
 ## 2. Provision and deploy in import mode
 
-Use a volume of adequate capacity mounted at /vyom-data. Set VYOM_CLOUD_MODE=import. This mode exposes only a shallow health endpoint and does not open or initialize the SQLite database. Configure Dockerfile.cloud at repository root and the healthcheck /cloud-health. Use a single replica and worker. Deploy the cloud-full-deployment branch. Do not expose a public domain yet.
+Use a volume of adequate capacity mounted at /vyom-data. Set VYOM_CLOUD_MODE=import. This mode exposes only a shallow health endpoint and does not open or initialize the SQLite database. Configure Dockerfile.cloud at repository root and the healthcheck /cloud_health. Use a single replica and worker. Deploy the cloud-full-deployment branch. Do not expose a public domain yet.
 
 ## 3. Upload and verify
 
