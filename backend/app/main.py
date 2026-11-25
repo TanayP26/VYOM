@@ -116,7 +116,25 @@ def start_run(req:RunRequest,bg:BackgroundTasks,db:Session=Depends(get_db)):
 @app.get("/api/analysis/runs")
 def runs(limit:int=Query(20,ge=1,le=100),db:Session=Depends(get_db)):
     rows=db.query(AnalysisRun).order_by(desc(AnalysisRun.id)).limit(limit).all()
-    return [{"id":r.id,"kind":r.kind,"scope":r.scope,"status":r.status,"processed":r.processed,"total":r.total,"summary":r.summary,"configuration":r.configuration,"artifact_path":r.artifact_path,"error":r.error.splitlines()[0] if r.error else None,"started":r.started.isoformat() if r.started else None,"completed":r.completed.isoformat() if r.completed else None} for r in rows]
+    def display_summary(r):
+        summary = dict(r.summary or {})
+        if r.status != "completed" or summary.get("operator_incident_status"):
+            return summary
+        # Recover display provenance from archived manifests without modifying them.
+        manifest = cfg.resolve(cfg.artifact_dir) / f"run_{r.id:05d}" / "manifest.json"
+        try:
+            reports = json.loads(manifest.read_text(encoding="utf-8")).get("reports", [])
+            statuses = [x.get("operator_incident_status") for x in reports]
+            if statuses and all(x == "abstained" for x in statuses):
+                summary["operator_incident_status"] = "abstained"
+            elif "abstained" in statuses:
+                summary["operator_incident_status"] = "partially_abstained"
+            elif statuses and all(x == "available" for x in statuses):
+                summary["operator_incident_status"] = "available"
+        except (OSError, ValueError, TypeError, AttributeError):
+            pass
+        return summary
+    return [{"id":r.id,"kind":r.kind,"scope":r.scope,"status":r.status,"processed":r.processed,"total":r.total,"summary":display_summary(r),"configuration":r.configuration,"artifact_path":r.artifact_path,"error":r.error.splitlines()[0] if r.error else None,"started":r.started.isoformat() if r.started else None,"completed":r.completed.isoformat() if r.completed else None} for r in rows]
 
 @app.get("/api/events")
 def events(run_id:int|None=None,channel:str|None=None,severity:str|None=None,detector:str|None=None,limit:int=Query(250,ge=1,le=2000),db:Session=Depends(get_db)):
@@ -155,6 +173,10 @@ def reports():
                 result.append({"path":str(p),"channel":d.get("channel"),"status":d.get("status"),
                     "events":d.get("incidents",d.get("events")),
                     "metrics":d.get("event_metrics_nominal_complement"),
+                    "supported_metrics":d.get("event_metrics_supported_ground_truth"),
+                    "operator_incident_status":d.get("operator_incident_status"),
+                    "operator_incident_reason":d.get("operator_incident_reason"),
+                    "event_burden":d.get("event_burden"),
                     "resources":d.get("resources"),
                     "engine":d.get("engine"),"detector_evidence":d.get("detector_evidence")})
             except Exception:pass
