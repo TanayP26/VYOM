@@ -61,7 +61,7 @@ class Gate:
         async def deny(code, detail, headers=None):
             await JSONResponse({"detail": detail}, status_code=code,
                                headers=headers or {})(scope, receive, send)
-        if path == "/cloud-health" and method in {"GET", "HEAD"}:
+        if path == "/cloud_health" and method in {"GET", "HEAD"}:
             await JSONResponse({"status": "ok"})(scope, receive, send)
             return
         if MODE != "serve":
