@@ -1,0 +1,20 @@
+FROM node:22-alpine AS web
+WORKDIR /build
+COPY frontend/package*.json ./
+RUN npm ci
+COPY frontend/ ./
+ENV VITE_API_URL=/api
+RUN npm run build
+
+FROM python:3.11-slim
+WORKDIR /app
+ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+COPY backend/requirements.txt /app/requirements.txt
+RUN pip install --no-cache-dir -r requirements.txt
+COPY backend/app /app/app
+COPY docs /docs
+COPY cloud /app/cloud
+COPY --from=web /build/dist /app/static
+ENV DATABASE_URL=sqlite:////vyom-data/vyom.db DATASET_DIR=/vyom-data/dataset TELEMETRY_STORE_DIR=/vyom-data/telemetry ARTIFACT_DIR=/vyom-data/reports EXPERIMENT_DIR=/vyom-data/experiments VYOM_CLOUD_MODE=import
+EXPOSE 8080
+CMD ["sh","-c","exec uvicorn cloud.entry:app --host 0.0.0.0 --port ${PORT:-8080} --workers 1"]
