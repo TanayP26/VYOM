@@ -25,7 +25,7 @@ def auth():
 
 def test_import_mode(monkeypatch):
     c=client(monkeypatch,"import")
-    assert c.get("/cloud-health").status_code==200
+    assert c.get("/cloud_health").status_code==200
     assert c.get("/",headers=auth()).status_code==503
 
 def test_auth_and_origin(monkeypatch):
